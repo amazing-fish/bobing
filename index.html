@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>中秋博饼</title>
+  <meta name="description" content="物理仿真的中秋博饼模拟器，支持线上多人与电脑玩家">
+  <meta name="theme-color" content="#7a0f0f">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect x='6' y='6' width='52' height='52' rx='10' fill='%23fbf7ee' stroke='%23b81d1d' stroke-width='3'/%3E%3Ccircle cx='22' cy='22' r='6' fill='%23c8161d'/%3E%3Ccircle cx='42' cy='22' r='6' fill='%23c8161d'/%3E%3Ccircle cx='22' cy='42' r='6' fill='%23c8161d'/%3E%3Ccircle cx='42' cy='42' r='6' fill='%23c8161d'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="css/style.css">
+  <script type="importmap">
+    { "imports": { "three": "./vendor/three/three.module.js", "three/addons/": "./vendor/three/addons/" } }
+  </script>
+  <script src="vendor/peerjs/peerjs.min.js" defer></script>
+  <script type="module" src="js/main.js"></script>
+</head>
+<body>
+  <canvas id="stage" aria-label="博饼碗与骰子的三维场景"></canvas>
+
+  <div id="loading" class="overlay center">
+    <div class="loading-box"><div class="spinner" aria-hidden="true"></div><p id="loading-text">正在准备骰子和碗…</p></div>
+  </div>
+
+  <!-- 首页 -->
+  <section id="screen-home" class="screen overlay center" hidden>
+    <div class="card home-card">
+      <div class="lanterns" aria-hidden="true"><span></span><span></span></div>
+      <h1 class="title">中秋博饼</h1>
+      <p class="subtitle">六颗骰子，一碗定输赢</p>
+      <label class="field">
+        <span>你的昵称</span>
+        <input id="in-name" maxlength="12" autocomplete="off" placeholder="例如：阿明">
+      </label>
+      <button id="btn-create" class="btn gold">创建联机房间</button>
+      <div class="join-row">
+        <input id="in-code" maxlength="5" placeholder="房间号" aria-label="房间号" autocapitalize="characters" spellcheck="false">
+        <button id="btn-join" class="btn">加入</button>
+      </div>
+      <button id="btn-local" class="btn ghost">单机 / 同屏多人</button>
+      <p id="home-msg" class="msg" role="status" aria-live="polite"></p>
+      <button class="link" data-open="dlg-rules">玩法规则</button>
+    </div>
+  </section>
+
+  <!-- 房间大厅 -->
+  <section id="screen-lobby" class="screen overlay center" hidden>
+    <div class="card lobby-card">
+      <h2 id="lobby-title">房间</h2>
+      <div id="share-box" class="share-box">
+        <div class="code-label">房间号</div>
+        <div id="room-code" class="room-code">-----</div>
+        <button id="btn-copy" class="btn small">复制邀请链接</button>
+        <p class="hint">把链接发给朋友，打开即可加入。联机为点对点直连，房主关闭页面则房间解散。</p>
+      </div>
+      <h3>玩家 <span id="player-count" class="muted"></span></h3>
+      <ul id="lobby-players" class="lobby-players"></ul>
+      <div id="host-tools" class="host-tools">
+        <div id="local-add" class="join-row">
+          <input id="in-local-name" maxlength="12" placeholder="同屏玩家昵称" aria-label="同屏玩家昵称">
+          <button id="btn-add-local" class="btn small">添加玩家</button>
+        </div>
+        <button id="btn-add-bot" class="btn small ghost">添加电脑玩家</button>
+      </div>
+      <h3>奖品 <span id="pool-total" class="muted"></span></h3>
+      <div id="pool-editor" class="pool-editor"></div>
+      <div id="pool-presets" class="presets">
+        <button class="btn tiny ghost" data-preset="standard">标准 63 饼</button>
+        <button class="btn tiny ghost" data-preset="quick">快速局</button>
+      </div>
+      <div class="row">
+        <button id="btn-leave" class="btn ghost">离开</button>
+        <button id="btn-start" class="btn gold">开始博饼</button>
+      </div>
+      <p id="lobby-msg" class="msg" role="status" aria-live="polite"></p>
+    </div>
+  </section>
+
+  <!-- 对局 -->
+  <section id="screen-game" class="screen" hidden>
+    <header class="topbar">
+      <button id="btn-exit" class="btn tiny ghost">离开</button>
+      <div id="pool-bar" class="pool-bar" aria-label="剩余奖品"></div>
+      <div class="top-actions">
+        <button id="btn-panel" class="btn tiny ghost panel-toggle" aria-expanded="false" aria-controls="side">战况</button>
+        <button id="btn-cam" class="btn tiny ghost" aria-pressed="false" title="跟随：镜头自动切到当前玩家；自由：自己拖动旋转">视角:跟随</button>
+        <button id="btn-mute" class="btn tiny ghost" aria-pressed="false">音效</button>
+        <button class="btn tiny ghost" data-open="dlg-rules">规则</button>
+      </div>
+    </header>
+    <div id="turn-banner" class="turn-banner" role="status" aria-live="polite"></div>
+    <aside id="side" class="side">
+      <div id="zy-box" class="zy-box"></div>
+      <ul id="players" class="players"></ul>
+      <h4>记录</h4>
+      <ol id="log" class="log"></ol>
+    </aside>
+    <div class="throw-area">
+      <p id="throw-hint" class="throw-hint" hidden>在碗上<b>按住</b>抓起骰子 → <b>拖动</b>摇一摇 → <b>甩一下松手</b></p>
+      <div id="power" class="power" aria-hidden="true" hidden><div id="power-fill" class="power-fill"></div><span id="power-label"></span></div>
+      <div class="throw-row">
+        <button id="btn-throw" class="btn throw" disabled>等待其他玩家</button>
+        <button id="btn-motion" class="btn throw ghost" aria-pressed="false" hidden>体感摇骰：关</button>
+      </div>
+      <p class="hint key-hint">空格键 = 一键掷骰 · 自由视角下右键拖动旋转</p>
+    </div>
+    <div id="toast" class="toast" hidden aria-live="assertive"></div>
+    <div id="confetti" class="confetti" aria-hidden="true"></div>
+  </section>
+
+  <!-- 规则 -->
+  <dialog id="dlg-rules" class="dialog">
+    <h2>博饼规则</h2>
+    <div id="rules-body"></div>
+    <form method="dialog"><button class="btn gold">知道了</button></form>
+  </dialog>
+
+  <!-- 结算 -->
+  <dialog id="dlg-end" class="dialog">
+    <h2>奖品拿完啦</h2>
+    <p id="end-zy" class="end-zy"></p>
+    <table class="rank">
+      <thead><tr><th>名次</th><th>玩家</th><th>奖品</th><th>积分</th></tr></thead>
+      <tbody id="end-rank"></tbody>
+    </table>
+    <div class="row">
+      <button id="btn-end-home" class="btn ghost">回首页</button>
+      <button id="btn-end-close" class="btn ghost">看看牌桌</button>
+      <button id="btn-rematch" class="btn gold">再来一局</button>
+    </div>
+    <p id="end-wait" class="hint">等待房主开始下一局…</p>
+  </dialog>
+</body>
+</html>
