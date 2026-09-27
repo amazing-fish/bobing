@@ -133,3 +133,41 @@ test('电脑玩家：自动完成抓起—摇—甩，带手部轨迹', async ()
   assert.equal(rolls[0].frames.length, rolls[0].frameCount * STRIDE);
   host.close();
 });
+
+test('客人意外断线：保留座位，重连后不打扰对局；主动离开立即下线', () => {
+  const { host, a } = setup();
+  const logs = () => host.game.state.log.map((l) => l.text).join('|');
+  a.close();
+  const pa = host.game.players.find((p) => p.id === 'a');
+  assert.equal(pa.online, true, '断线后座位先保留');
+  assert.equal(host.game.currentPlayer().id, 'a', '不跳过其回合');
+  const a2 = fakeConn();
+  host.onConn(a2);
+  a2.recv({ type: 'hello', id: 'a', name: 'A' });
+  assert.equal(a2.of('welcome').length, 1);
+  assert.equal(host.grace.size, 0, '重连后取消下线计时');
+  assert.doesNotMatch(logs(), /A 离开了|A 回到了牌桌/);
+  a2.recv({ type: 'leave' });
+  assert.equal(pa.online, false, '主动离开立即下线');
+  assert.match(logs(), /A 离开了/);
+  host.close();
+});
+
+test('心跳带版本号；客人要同步时房主回最新状态；房主从后台醒来不误判客人掉线', () => {
+  const { host, a } = setup();
+  a.recv({ type: 'ping' });
+  assert.equal(a.of('pong').at(-1).rev, host.rev);
+  a.recv({ type: 'sync' });
+  assert.equal(a.of('state').at(-1).rev, host.rev);
+  // 模拟房主锁屏 60 秒：lastSeen 很旧，但 lastTick 更旧
+  for (const e of host.conns.values()) e.lastSeen = Date.now() - 60000;
+  host.lastTick = Date.now() - 60000;
+  host.checkPresence();
+  assert.equal(a.open, true, '不应踢掉客人');
+  assert.ok(a.of('ping').length >= 1);
+  // 真正失联（房主一直醒着）才断开
+  for (const e of host.conns.values()) e.lastSeen = Date.now() - 60000;
+  host.checkPresence();
+  assert.equal(a.open, false);
+  host.close();
+});

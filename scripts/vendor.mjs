@@ -16,8 +16,6 @@ const files = [
   ['three/LICENSE', 'three/LICENSE'],
   ['@dimforge/rapier3d-compat/dist/rapier.mjs', 'rapier/rapier.mjs'],
   ['@dimforge/rapier3d-compat/LICENSE', 'rapier/LICENSE'],
-  ['peerjs/dist/peerjs.min.js', 'peerjs/peerjs.min.js'],
-  ['peerjs/LICENSE', 'peerjs/LICENSE'],
 ];
 
 for (const [from, to] of files) {

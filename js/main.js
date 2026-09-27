@@ -117,14 +117,16 @@ async function startSession(kind) {
     return;
   }
   setButtonsBusy(true);
-  setMsg('home-msg', kind === 'client' ? '正在连接房间…' : kind === 'host' ? '正在创建房间…' : '', true);
+  setMsg('home-msg', kind === 'client' ? '正在寻找房间…' : kind === 'host' ? '正在创建房间…' : '', true);
   const s = kind === 'client' ? new ClientSession({ me, code }) : new HostSession({ mode: kind, me });
   bindSession(s);
   try {
     await s.open();
     session = s;
+    keepAwake(true);
     if (s.code) history.replaceState(null, '', `?room=${s.code}`);
     setMsg('home-msg', '');
+    renderNet();
     render(s.state ? structuredClone(s.state) : view);
   } catch (e) {
     console.warn(e);
@@ -153,15 +155,45 @@ function bindSession(s) {
     if (s === session) onHold(h);
   });
   s.on('warn', (text) => flashMsg(text));
+  s.on('net', () => s === session && renderNet());
   s.on('error', (text) => {
     if (s !== session) return;
     leave(text);
   });
 }
 
+/** 客人的连接状态：断线重连中给出提示；大厅里显示是直连还是经服务器中转 */
+function renderNet() {
+  const client = session?.mode === 'client';
+  const el = $('net-status');
+  el.hidden = !client || session.status !== 'reconnecting';
+  const kind = client ? session.linkKind : null;
+  $('link-kind').textContent = kind === 'p2p' ? '已与房主直连' : kind === 'relay' ? '经服务器中转（直连不可用，延迟稍高但不影响游戏）' : '';
+  updateThrowButton();
+}
+
+// ---------- 防止手机息屏 ----------
+// 息屏后浏览器会冻结页面、联机随之中断；在房间里时保持屏幕常亮（切回页面时重新申请）
+let wake = null; // Promise<WakeLockSentinel>
+function keepAwake(on) {
+  if (!navigator.wakeLock) return;
+  if (!on) {
+    wake?.then((l) => l.release()).catch(() => {});
+    wake = null;
+    return;
+  }
+  if (wake || document.visibilityState !== 'visible') return;
+  const p = navigator.wakeLock.request('screen');
+  wake = p;
+  p.then((l) => l.addEventListener('release', () => wake === p && (wake = null))).catch(() => wake === p && (wake = null));
+}
+document.addEventListener('visibilitychange', () => session && keepAwake(true));
+
 function leave(msg = '') {
   session?.close();
   session = null;
+  keepAwake(false);
+  $('net-status').hidden = true;
   clearTimeout(grab?.timer);
   clearTimeout(awaiting?.timer);
   grab = null;
@@ -218,7 +250,7 @@ function seatAz(st, playerId) {
 /** 镜头跟随：轮到谁就切到谁的座位；本局结束则俯看碗 */
 function directCamera(st) {
   const cur = st.players[st.turn];
-  if (st.phase === 'ended') stage.setShot({ kind: 'result', az: stage.cam.az });
+  if (st.phase === 'ended') stage.setShot({ kind: 'result', az: stage.shot.az ?? stage.cam.az });
   else if (cur) stage.setShot({ kind: 'seat', az: seatAz(st, cur.id) });
 }
 
@@ -365,23 +397,35 @@ function setupGame() {
 }
 
 // ---------- 手机体感摇骰 ----------
-// 按住碗 + 晃动手机：手机的加速度直接推动掌心，骰子在里面随之翻滚；松手掷出
-let motion = { on: false, a: null, t: 0 };
+// 手机上不再用手指按住拖动（容易触发长按菜单、误触即掷出）。两种方式：
+// 1) 一键掷骰；2) 开启体感后，轮到你时直接晃手机：一晃就把骰子抓进掌心，晃动推着掌心走，
+//    停下来就顺势掷出（也可以点"掷出"）。不需要按住屏幕。
+const TOUCH = matchMedia('(pointer: coarse)').matches;
+const SHAKE_START = 6; // 晃动强度（m/s²，平滑后）超过它才开始，避免拿起手机时误触发
+const SHAKE_CALM = 2.5; // 低于它持续 CALM_MS 视为停下
+const CALM_MS = 350;
+const SHAKE_MIN_MS = 700; // 至少摇这么久才会自动掷出
+const SHAKE_MAX_MS = 6000;
+let motion = { on: false, a: null, t: 0, energy: 0, peak: 0, calmSince: 0 };
+
+function motionHint() {
+  if (!TOUCH) return '在碗上<b>按住</b>抓起骰子 → <b>拖动</b>摇一摇 → <b>甩一下松手</b>';
+  return motion.on ? '<b>晃动手机</b>摇骰子，<b>停下</b>就掷出' : '点<b>一键掷骰</b>，或开启<b>体感摇骰</b>后晃手机';
+}
 
 function setupMotion() {
   const btn = $('btn-motion');
-  const touch = matchMedia('(pointer: coarse)').matches || navigator.maxTouchPoints > 0;
-  if (!('DeviceMotionEvent' in window) || !touch) return;
+  $('throw-hint').innerHTML = motionHint();
+  if (!('DeviceMotionEvent' in window) || !TOUCH) return;
   btn.hidden = false;
+  const needPermission = typeof DeviceMotionEvent.requestPermission === 'function';
   const sync = () => {
     btn.textContent = motion.on ? '体感摇骰：开' : '体感摇骰：关';
     btn.setAttribute('aria-pressed', String(motion.on));
-    $('throw-hint').innerHTML = motion.on
-      ? '<b>按住</b>碗里的骰子 → <b>晃动手机</b>摇一摇 → <b>松手</b>掷出'
-      : '在碗上<b>按住</b>抓起骰子 → <b>拖动</b>摇一摇 → <b>甩一下松手</b>';
+    $('throw-hint').innerHTML = motionHint();
   };
   btn.onclick = async () => {
-    if (!motion.on && typeof DeviceMotionEvent.requestPermission === 'function') {
+    if (!motion.on && needPermission) {
       // iOS 13+ 需要在点击里申请权限
       try {
         if ((await DeviceMotionEvent.requestPermission()) !== 'granted') {
@@ -394,15 +438,17 @@ function setupMotion() {
       }
     }
     motion.on = !motion.on;
+    motion.energy = 0;
     store.set('bobing.motion', motion.on ? '1' : '0');
     sync();
     if (motion.on) navigator.vibrate?.(20);
   };
   // 安卓不需要授权，记住上次的选择；iOS 每次需要点一下授权
-  if (store.get('bobing.motion', '0') === '1' && typeof DeviceMotionEvent.requestPermission !== 'function') motion.on = true;
+  if (store.get('bobing.motion', '0') === '1' && !needPermission) motion.on = true;
   sync();
 
   let lp = null; // 含重力时的低通值（用于没有 acceleration 的设备）
+  let lastT = 0;
   window.addEventListener('devicemotion', (e) => {
     if (!motion.on) return;
     let a = e.acceleration;
@@ -412,9 +458,40 @@ function setupMotion() {
       lp = lp ? { x: lp.x * 0.9 + g.x * 0.1, y: lp.y * 0.9 + g.y * 0.1, z: lp.z * 0.9 + g.z * 0.1 } : { x: g.x, y: g.y, z: g.z };
       a = { x: g.x - lp.x, y: g.y - lp.y, z: g.z - lp.z };
     }
+    const now = performance.now();
+    const dt = Math.min(0.1, (now - (lastT || now)) / 1000) || 0.016;
+    lastT = now;
     motion.a = { x: a.x || 0, y: a.y || 0, z: a.z || 0 };
-    motion.t = performance.now();
+    motion.t = now;
+    // 晃动强度：加速度大小的指数平均（约 0.15 秒）
+    const mag = Math.hypot(motion.a.x, motion.a.y, motion.a.z);
+    motion.energy += (mag - motion.energy) * Math.min(1, dt / 0.15);
+    onShake(now);
   });
+}
+
+/** 由晃动强度决定：开始摇（抓起骰子）→ 摇动中 → 停下（掷出） */
+function onShake(now) {
+  const e = motion.energy;
+  if (!grab) {
+    if (e > SHAKE_START && canGrab() && !document.querySelector('dialog[open]')) startShakeGrab();
+    return;
+  }
+  if (grab.kind !== 'shake') return;
+  motion.peak = Math.max(motion.peak, e);
+  if (e > SHAKE_CALM) motion.calmSince = 0;
+  else motion.calmSince ||= now;
+  const held = now - grab.t0;
+  if ((held > SHAKE_MIN_MS && motion.calmSince && now - motion.calmSince > CALM_MS) || held > SHAKE_MAX_MS) releaseGrab();
+}
+
+function startShakeGrab() {
+  unlockAudio();
+  motion.peak = motion.energy;
+  motion.calmSince = 0;
+  navigator.vibrate?.(30);
+  // 掌心停在碗心上方，晃动推着它走，弹簧把它拉回来
+  startGrab(null, { x: 0, z: 0 }, 'shake');
 }
 
 /** 把手机加速度（设备坐标，m/s²）换算成掌心在世界坐标里受到的加速度（cm/s²） */
@@ -433,6 +510,14 @@ function motionToWorld() {
     y: z * K * 0.6,
     z: (-Math.cos(az) * sx - Math.sin(az) * sy) * K,
   };
+}
+
+/** 体感摇完停下时，手已经几乎不动了：补一个朝碗对面的轻抛，力度随刚才摇得多猛 */
+function shakeToss() {
+  const k = Math.min(1, Math.max(0, (motion.peak - SHAKE_START) / 12));
+  const az = stage.cam.az; // 镜头在玩家身后，朝碗心方向 = -(cos az, sin az)
+  const sp = 45 + 45 * k;
+  return { x: -Math.cos(az) * sp, z: -Math.sin(az) * sp };
 }
 
 function renderGame(st) {
@@ -478,18 +563,25 @@ function canGrab() {
 function updateThrowButton() {
   const btn = $('btn-throw');
   const ok = canGrab();
-  btn.disabled = !ok;
-  btn.textContent = view?.phase === 'ended' ? '本局已结束' : hand.mode === 'hold' ? '摇一摇，松手掷出' : ok ? '一键掷骰' : '等待其他玩家';
+  const shaking = grab?.kind === 'shake';
+  btn.disabled = !ok && !shaking;
+  btn.textContent =
+    view?.phase === 'ended' ? '本局已结束'
+    : shaking ? '掷出'
+    : hand.mode === 'hold' ? '摇一摇，松手掷出'
+    : ok ? '一键掷骰'
+    : session?.status === 'reconnecting' ? '重连中…'
+    : '等待其他玩家';
   $('throw-hint').hidden = !ok;
   $('power').hidden = hand.mode !== 'hold';
-  stage.canvas.classList.toggle('grabbable', ok);
+  stage.canvas.classList.toggle('grabbable', ok && !TOUCH);
 }
 
 // ---------- 手势摇骰 ----------
 // 在碗上按住 → 骰子进掌心；拖动摇晃（骰子在掌心里真实碰撞）；甩动并松手 → 掷出
 const hand = new HandController();
 const HOLD_SEND_MS = 50;
-const HOLD_MAX_MS = 12000;
+const HOLD_MAX_MS = 12000; // 鼠标拖着不放时的兜底；体感摇骰另有 SHAKE_MAX_MS
 let grab = null; // { pointerId, lastSend, timer, sounds }
 let awaiting = null; // 已发出投掷请求，等待房主结果 { t, timer }
 let lastBuzz = 0;
@@ -506,7 +598,8 @@ function setupThrow() {
         e.stopImmediatePropagation();
         return;
       }
-      if (e.button !== 0 || !canGrab()) return;
+      // 触屏不用手指抓骰（长按会弹系统菜单、轻碰就掷出）：用一键掷骰或体感摇骰
+      if (e.pointerType === 'touch' || e.button !== 0 || !canGrab()) return;
       const xz = stage.pointerToHand(e.clientX, e.clientY);
       if (!xz || Math.hypot(xz.x, xz.z) > HAND.reach + 2) return;
       e.stopImmediatePropagation();
@@ -535,6 +628,9 @@ function setupThrow() {
   };
   window.addEventListener('pointerup', end, true);
   window.addEventListener('pointercancel', end, true);
+  // 手机上长按不弹"复制/查词"菜单
+  $('screen-game').addEventListener('contextmenu', (e) => e.preventDefault());
+  canvas.addEventListener('contextmenu', (e) => e.preventDefault());
 
   // 一键掷骰（也是键盘与读屏用户的入口）：自动完成抓起、摇晃、掷出
   $('btn-throw').addEventListener('click', autoThrow);
@@ -546,6 +642,7 @@ function setupThrow() {
 }
 
 function autoThrow() {
+  if (grab?.kind === 'shake') return releaseGrab();
   if (!canGrab()) return;
   unlockAudio();
   lockThrow();
@@ -568,20 +665,22 @@ function lockThrow() {
   updateThrowButton();
 }
 
-function startGrab(pointerId, xz) {
+/** kind: 'drag' 鼠标拖动 | 'shake' 手机体感 */
+function startGrab(pointerId, xz, kind = 'drag') {
   unlockAudio();
   hand.grab(xz);
   hand.setTarget(xz);
-  grab = { pointerId, lastSend: 0, sounds: [], timer: setTimeout(releaseGrab, HOLD_MAX_MS) };
+  grab = { kind, pointerId, t0: performance.now(), lastSend: 0, sounds: [], timer: setTimeout(releaseGrab, HOLD_MAX_MS) };
   stage.setLive(hand.frame, true);
   const cur = view.players[view.turn];
-  $('turn-banner').textContent = `${session.mode === 'local' ? cur.name : '你'}：摇一摇，甩出去`;
+  const who = session.mode === 'local' ? cur.name : '你';
+  $('turn-banner').textContent = kind === 'shake' ? `${who}：摇啊摇，停下就掷出` : `${who}：摇一摇，甩出去`;
   updateThrowButton();
 }
 
 function tickHand(dt) {
   if (!hand.active) return;
-  if (hand.mode === 'hold') hand.setExternal(motionToWorld());
+  if (hand.mode === 'hold') hand.setExternal(grab?.kind === 'shake' ? motionToWorld() : null);
   const sounds = hand.update(dt);
   for (const s of sounds) {
     playImpact(s.k, s.s);
@@ -593,12 +692,15 @@ function tickHand(dt) {
   if (hand.mode !== 'hold') return;
   grab.sounds.push(...sounds.map((s) => [s.k, s.s]));
   stage.setAim({ x: hand.pos.x, z: hand.pos.z });
-  const sp = hand.speed01();
-  $('power-fill').style.width = `${sp * 100}%`;
-  if (motionToWorld() && sp < 0.3) {
-    $('power-label').textContent = hand.outside() ? '在碗外！松手会掉桌上' : '晃动中…';
+  if (grab.kind === 'shake') {
+    // 体感：显示晃动强度；停在碗心上方，不会掉出碗外
+    const k = Math.min(1, motion.energy / 18);
+    $('power-fill').style.width = `${k * 100}%`;
+    $('power-label').textContent = motion.calmSince ? '停下了，掷出！' : k < 0.5 ? '摇啊摇…' : '摇得正欢，停下就掷出';
     return sendHold();
   }
+  const sp = hand.speed01();
+  $('power-fill').style.width = `${sp * 100}%`;
   // 阈值对应实测出碗率：约 120 cm/s 以下安全，190 以上明显容易出碗
   $('power-label').textContent = hand.outside() ? '在碗外！松手会掉桌上' : sp < 0.3 ? '轻摇' : sp < 0.58 ? '摇得正好' : sp < 0.88 ? '用力' : '太猛，小心出碗';
   sendHold();
@@ -615,8 +717,9 @@ function sendHold() {
 function releaseGrab() {
   if (!grab) return;
   clearTimeout(grab.timer);
+  const toss = grab.kind === 'shake' ? shakeToss() : null;
   grab = null;
-  const init = hand.release();
+  const init = hand.release(toss);
   stage.setAim(null);
   if (!init) return updateThrowButton();
   // 松手后继续本地预测（骰子立即飞出），同时请求房主给出权威结果
@@ -648,10 +751,11 @@ async function playRoll(roll) {
   $('turn-banner').classList.remove('mine');
   if (roll.mode !== 'init') playShake();
   // 投掷时镜头站在投掷者身后（本机已在该机位则不动）
-  if (roll.before) stage.setShot({ kind: 'seat', az: seatAz(roll.before, roll.outcome.playerId) }, 600);
+  const throwerAz = roll.before ? seatAz(roll.before, roll.outcome.playerId) : stage.cam.az;
+  stage.setShot({ kind: 'seat', az: throwerAz }, 900);
   await stage.playRoll(roll, (ev) => playImpact(ev.k, ev.s), opts);
   // 骰子停稳：推近俯看点数
-  stage.setShot({ kind: 'result', az: stage.cam.az }, 700);
+  stage.setShot({ kind: 'result', az: throwerAz }, 1000);
   const info = describe(roll.outcome, roll.outMask);
   showToast(info, 2000);
   if (info.level >= 0) playChime(info.level);
@@ -763,7 +867,8 @@ function setupDialogs() {
   $('rules-body').innerHTML = `
     <h3>怎么玩</h3>
     <ol>
-      <li>轮到你时，在碗上按住抓起骰子，拖动摇一摇（骰子在掌心里真的会碰撞），再顺势一甩松手。也可以点“一键掷骰”或按空格。</li>
+      <li>电脑上：轮到你时，在碗上按住鼠标抓起骰子，拖动摇一摇（骰子在掌心里真的会碰撞），再顺势一甩松手。也可以点“一键掷骰”或按空格。</li>
+      <li>手机上：点“一键掷骰”；或开启“体感摇骰”，轮到你时直接晃手机，骰子在掌心里翻滚，停下来就掷出，不用按住屏幕。</li>
       <li>甩得越猛骰子越乱，也越容易蹦出碗外；在碗外松手会直接落到桌上。有骰子掉出碗外，本轮作废。</li>
       <li>状元可被更大的状元抢走；其余奖项博到即得。</li>
       <li>同时满足多个奖项，按最高奖项算；奖品拿完即止，最后的状元带走状元饼。</li>
