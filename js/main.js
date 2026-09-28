@@ -88,18 +88,24 @@ function setupHome() {
 
 function myIdentity() {
   // 身份放在 sessionStorage：刷新页面可凭同一 id 重回牌桌，同一浏览器开两个标签页也不会冲突
+  // key：只有本人知道的密钥，房主凭它确认重连的是同一个人（id 在对局状态里人人可见）
   let id = '';
+  let key = '';
   try {
     id = sessionStorage.getItem('bobing.id') || '';
-    if (!id) {
+    key = sessionStorage.getItem('bobing.key') || '';
+    if (!id || !key) {
       id = randomId();
+      key = randomId();
       sessionStorage.setItem('bobing.id', id);
+      sessionStorage.setItem('bobing.key', key);
     }
   } catch {
     id ||= randomId();
+    key ||= randomId();
   }
   const name = $('in-name').value.trim();
-  return { id, name };
+  return { id, key, name };
 }
 
 async function startSession(kind) {

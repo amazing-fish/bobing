@@ -3,18 +3,18 @@
 import { BobingGame } from './game.js';
 import { encodeFrames, decodeFrames, PICKUP_MS, STRIDE } from './physics.js';
 import { runSim, warmSim } from './sim-runner.js';
-import { Emitter, HostHub, joinRoom } from './net.js';
+import { Emitter, HostHub, joinRoom, CODE_CHARS, CODE_LEN } from './net.js';
+
+export { CODE_LEN };
 
 const SEATS = 8;
 const REVEAL_MS = 2200; // 骰子停稳后展示结果的时间
-const CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-// 房间号同时是加密密钥的来源（见 net.js），所以要足够长：10 位 ≈ 50 bit
-export const CODE_LEN = 10;
 const PING_MS = 3000;
 const SILENT_MS = 20000; // 这么久收不到对方任何消息，认为连接已断
 const SUSPEND_MS = 8000; // 本机计时器停摆这么久（锁屏、切后台），说明是自己睡着了，不怪对方
 const GRACE_MS = 30000; // 客人断线后保留座位多久（期间重连不打扰对局）
 const RECONNECT_MS = 90000; // 客人自动重连的最长时间
+const HELLO_RETRY_MS = 2000; // 入座请求走的是可丢的通道：没等到欢迎就重发
 const BOT_NAMES = ['阿福', '小月', '桂花', '团圆', '玉兔', '嫦娥', '吴刚', '招财'];
 
 export function randomCode(n = 5) {
@@ -70,6 +70,10 @@ export class HostSession extends Emitter {
     this.botTimer = null;
     this.conns = new Map(); // playerId -> { conn, lastSeen }
     this.grace = new Map(); // playerId -> 断线保留座位的计时器
+    // 玩家 id 是公开的（在对局状态里），所以每个 id 绑定一把只有本人知道的密钥：
+    // 客人第一次入座时绑定，之后凭同一把密钥才能以这个身份重连；房主、电脑、同屏玩家的 id 不接受外来入座
+    this.keys = new Map();
+    this.keys.set(me.id, null);
     this.hub = null;
     this.status = 'online';
   }
@@ -83,9 +87,9 @@ export class HostSession extends Emitter {
       this.emit('state', this.game.snapshot());
       return;
     }
-    this.code = randomCode(CODE_LEN);
-    this.hub = new HostHub(this.code, (link) => this.onConn(link));
+    this.hub = new HostHub((link) => this.onConn(link));
     await this.hub.start();
+    this.code = this.hub.code;
     this.game.state.code = this.code;
     this.lastTick = Date.now();
     this.presence = setInterval(() => this.checkPresence(), PING_MS);
@@ -123,13 +127,21 @@ export class HostSession extends Emitter {
     if (msg.type === 'hello') {
       const id = String(msg.id || '').slice(0, 64);
       const name = String(msg.name || '玩家').slice(0, 12);
+      const key = typeof msg.key === 'string' ? msg.key.slice(0, 128) : '';
       if (!id) return;
+      // 冒用别人的 id（id 在对局状态里人人可见）：拒绝
+      if (key.length < 16 || (this.keys.has(id) && this.keys.get(id) !== key)) {
+        conn.send({ type: 'denied' });
+        setTimeout(() => conn.close(), 300);
+        return;
+      }
       const known = this.game.players.find((p) => p.id === id);
       if (!known && this.game.players.length >= SEATS) {
         conn.send({ type: 'full' });
         setTimeout(() => conn.close(), 300);
         return;
       }
+      this.keys.set(id, key);
       const old = this.conns.get(id);
       conn.playerId = id;
       this.conns.set(id, { conn, lastSeen: Date.now() });
@@ -344,12 +356,16 @@ export class HostSession extends Emitter {
     this.guard(() => {
       const used = new Set(this.game.players.map((p) => p.name));
       const name = BOT_NAMES.find((n) => !used.has(n)) || `电脑${this.game.players.length}`;
-      this.game.addPlayer({ id: `bot-${randomCode(6)}`, name, isBot: true });
+      const id = `bot-${randomCode(6)}`;
+      this.keys.set(id, null);
+      this.game.addPlayer({ id, name, isBot: true });
     });
   }
 
   addLocalPlayer(name) {
-    this.guard(() => this.game.addPlayer({ id: `local-${randomCode(6)}`, name: name || `玩家${this.game.players.length + 1}` }));
+    const id = `local-${randomCode(6)}`;
+    this.keys.set(id, null);
+    this.guard(() => this.game.addPlayer({ id, name: name || `玩家${this.game.players.length + 1}` }));
   }
 
   kick(id) {
@@ -362,6 +378,7 @@ export class HostSession extends Emitter {
     }
     clearTimeout(this.grace.get(id));
     this.grace.delete(id);
+    this.keys.delete(id);
     this.guard(() => this.game.removePlayer(id));
   }
 
@@ -386,8 +403,9 @@ export class HostSession extends Emitter {
  * 连接意外中断时自动重连（同一个玩家 id 回到原座位），期间 status = 'reconnecting'
  */
 export class ClientSession extends Emitter {
-  constructor({ me, code }) {
+  constructor({ me, code, join = joinRoom }) {
     super();
+    this.join = join;
     this.mode = 'client';
     this.isHost = false;
     this.meId = me.id;
@@ -417,7 +435,7 @@ export class ClientSession extends Emitter {
   }
 
   async connect() {
-    const link = await joinRoom(this.code);
+    const link = await this.join(this.code);
     if (this.closed) return link.close();
     this.link = link;
     this.lastMsg = Date.now();
@@ -434,7 +452,10 @@ export class ClientSession extends Emitter {
       this.lastSync = 0;
       link.send({ type: 'sync' });
     });
-    link.send({ type: 'hello', id: this.me.id, name: this.me.name });
+    // 中转是可丢的（QoS 0）：没等到欢迎就一直重发入座请求，房主对重复的入座会再回一次欢迎
+    const hello = () => link.send({ type: 'hello', id: this.me.id, name: this.me.name, key: this.me.key });
+    hello();
+    const retry = setInterval(hello, HELLO_RETRY_MS);
     try {
       await welcome;
     } catch (e) {
@@ -442,6 +463,7 @@ export class ClientSession extends Emitter {
       link.close();
       throw e;
     } finally {
+      clearInterval(retry);
       this.welcomeWait = null;
     }
     this.setStatus('online');
@@ -474,7 +496,7 @@ export class ClientSession extends Emitter {
         return;
       } catch (e) {
         last = e;
-        if (e?.type === 'full') break;
+        if (e?.type === 'full' || e?.type === 'denied') break;
       }
       await new Promise((r) => setTimeout(r, wait));
       wait = Math.min(4000, wait * 2);
@@ -552,6 +574,9 @@ export class ClientSession extends Emitter {
       case 'full':
         this.welcomeWait?.reject({ type: 'full' });
         break;
+      case 'denied':
+        this.welcomeWait?.reject({ type: 'denied' });
+        break;
       case 'kicked':
         this.lost('你已被房主移出房间');
         break;
@@ -601,6 +626,7 @@ export function friendlyError(e) {
     timeout: '房主没有响应，请稍后重试',
     insecure: '当前页面不是安全连接（https），无法联机加密，请用 https 地址打开',
     full: '房间已满（最多 8 人）',
+    denied: '这个身份已在房间里（可能在别的页面打开了），请关闭其他页面后重试',
   };
 
   return map[type] || (typeof e === 'string' ? e : e?.message || '连接失败');

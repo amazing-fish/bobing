@@ -2,9 +2,9 @@
 // 1) 找房间、交换 WebRTC 信令、兜底转发，都走公共 MQTT 服务器（WebSocket over TLS，和普通 HTTPS 一样容易连通）；
 // 2) 连上后尝试升级为 WebRTC 直连（DataChannel），直连失败（对称 NAT、VPN 屏蔽 UDP 等）就一直走服务器中转。
 // 房主同时挂在多台服务器上，客人向所有服务器"敲门"，谁先应答用谁，所以只要双方能共同连上任意一台即可。
-// 公共服务器上传的全是用房间号派生的密钥加密的密文，见下方"房间密钥"。
+// 公共服务器上只有密文，见下方"加密"。
 export const BROKERS = ['wss://broker-cn.emqx.io:8084/mqtt', 'wss://broker.emqx.io:8084/mqtt', 'wss://broker.hivemq.com:8884/mqtt'];
-const NS = 'bobing-cn/v3';
+const NS = 'bobing-cn/v4';
 export const ICE_SERVERS = [
   { urls: 'stun:stun.miwifi.com:3478' },
   { urls: 'stun:stun.chat.bilibili.com:3478' },
@@ -82,6 +82,7 @@ export const mqtt = {
   connect: (clientId, keepalive) =>
     packet(0x10, [str('MQTT'), Uint8Array.of(4, 0x02, keepalive >> 8, keepalive & 255), str(clientId)]),
   subscribe: (id, topic) => packet(0x82, [Uint8Array.of(id >> 8, id & 255), str(topic), Uint8Array.of(0)]),
+  unsubscribe: (id, topic) => packet(0xa2, [Uint8Array.of(id >> 8, id & 255), str(topic)]),
   publish: (topic, payload) => packet(0x30, [str(topic), enc.encode(payload)]),
   pingreq: () => Uint8Array.of(0xc0, 0),
   disconnect: () => Uint8Array.of(0xe0, 0),
@@ -127,13 +128,29 @@ export class MqttParser {
   }
 }
 
-// ---------- 房间密钥：公共服务器上的一切内容都加密并认证 ----------
-// 公共服务器谁都能订阅，所以房间号本身绝不出现在服务器上：由房间号（10 位，约 50 bit）经 PBKDF2 慢哈希
-// 派生出主题名和 AES-GCM 密钥。旁观者看到的只是随机主题下的密文，无法读取、伪造或篡改；
-// 想猜房间号只能逐个做 20 万次哈希，在房间的存活时间内不现实。重放由每条连接的随机 id 与递增计数挡住。
+// ---------- 加密：公共服务器上只有密文，知道房间号的人也冒充不了别人 ----------
+// 两层密钥：
+// 1) 房间密钥：由房间号经 PBKDF2 慢哈希派生主题名和 AES-GCM 密钥，只用于"敲门/应答"和房主的广播。
+//    旁观者没有房间号，看到的只是随机主题下的密文；想猜房间号只能逐个做 20 万次哈希。
+// 2) 连接密钥：每位客人与房主用 ECDH 临时协商，双向各一把 AES-GCM 密钥。别的客人即便知道房间号，
+//    也读不了、伪造不了这条连接上的任何消息。
+// 房间号就是房主签名公钥的指纹（SHA-256 的前 50 bit），客人据此验证应答确实出自房主：
+// 冒充房主必须找到指纹相同的另一把公钥，约 2^50 次运算，房间存活期内不现实。
+// 房主的广播（摇骰画面）用这把签名密钥签名，客人之间无法伪造。重放由递增计数挡住。
+export const CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+export const CODE_LEN = 10;
 const KDF_ITER = 200000;
-const KDF_SALT = 'bobing-cn/v3/room';
+const KDF_SALT = 'bobing-cn/v4/room';
+const EC = { name: 'ECDH', namedCurve: 'P-256' };
+const SIG = { name: 'ECDSA', namedCurve: 'P-256' };
+const SIG_ALG = { name: 'ECDSA', hash: 'SHA-256' };
 const rooms = new Map(); // code -> Promise<Room>
+
+function subtle() {
+  const s = globalThis.crypto?.subtle;
+  if (!s) throw { type: 'insecure' };
+  return s;
+}
 
 function b64(bytes) {
   let s = '';
@@ -148,7 +165,51 @@ function unb64(s) {
   return out;
 }
 
-/** 由房间号派生 { id: 主题名, seal(topic, obj), open(topic, str) }；同一房间号只算一次 */
+async function aeadSeal(key, topic, obj) {
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ct = new Uint8Array(await subtle().encrypt({ name: 'AES-GCM', iv, additionalData: enc.encode(topic) }, key, enc.encode(JSON.stringify(obj))));
+  const out = new Uint8Array(12 + ct.length);
+  out.set(iv);
+  out.set(ct, 12);
+  return b64(out);
+}
+
+async function aeadOpen(key, topic, str) {
+  try {
+    const bytes = unb64(str);
+    if (bytes.length < 29) return null;
+    const pt = await subtle().decrypt({ name: 'AES-GCM', iv: bytes.subarray(0, 12), additionalData: enc.encode(topic) }, key, bytes.subarray(12));
+    const msg = JSON.parse(dec.decode(pt));
+    return msg && typeof msg === 'object' ? msg : null;
+  } catch {
+    return null;
+  }
+}
+
+/** 公钥 → 房间号（SHA-256 前 50 bit，每 5 bit 一个字符） */
+export async function codeFromKey(rawPub) {
+  const h = new Uint8Array(await subtle().digest('SHA-256', rawPub));
+  let s = '', acc = 0, bits = 0, i = 0;
+  while (s.length < CODE_LEN) {
+    acc = (acc << 8) | h[i++];
+    bits += 8;
+    while (bits >= 5 && s.length < CODE_LEN) {
+      bits -= 5;
+      s += CODE_CHARS[(acc >> bits) & 31];
+    }
+    acc &= (1 << bits) - 1;
+  }
+  return s;
+}
+
+/** 房主身份：签名密钥对（私钥不可导出），房间号 = 公钥指纹 */
+export async function createHostIdentity() {
+  const kp = await subtle().generateKey(SIG, false, ['sign', 'verify']);
+  const pub = new Uint8Array(await subtle().exportKey('raw', kp.publicKey));
+  return { key: kp.privateKey, pub, code: await codeFromKey(pub) };
+}
+
+/** 由房间号派生房间密钥 { id: 主题名, key }；同一房间号只算一次 */
 export function deriveRoom(code) {
   let p = rooms.get(code);
   if (!p) {
@@ -160,46 +221,51 @@ export function deriveRoom(code) {
 }
 
 async function makeRoom(code) {
-  const subtle = globalThis.crypto?.subtle;
-  if (!subtle) throw { type: 'insecure' };
-  const base = await subtle.importKey('raw', enc.encode(code), 'PBKDF2', false, ['deriveBits']);
-  const master = await subtle.deriveBits({ name: 'PBKDF2', hash: 'SHA-256', salt: enc.encode(KDF_SALT), iterations: KDF_ITER }, base, 256);
-  const hk = await subtle.importKey('raw', master, 'HKDF', false, ['deriveBits', 'deriveKey']);
-  const info = (s) => ({ name: 'HKDF', hash: 'SHA-256', salt: new Uint8Array(0), info: enc.encode(s) });
-  const idBits = new Uint8Array(await subtle.deriveBits(info('topic'), hk, 128));
-  const key = await subtle.deriveKey(info('aead'), hk, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
+  const s = subtle();
+  const base = await s.importKey('raw', enc.encode(code), 'PBKDF2', false, ['deriveBits']);
+  const master = await s.deriveBits({ name: 'PBKDF2', hash: 'SHA-256', salt: enc.encode(KDF_SALT), iterations: KDF_ITER }, base, 256);
+  const hk = await s.importKey('raw', master, 'HKDF', false, ['deriveBits', 'deriveKey']);
+  const info = (x) => ({ name: 'HKDF', hash: 'SHA-256', salt: new Uint8Array(0), info: enc.encode(x) });
+  const idBits = new Uint8Array(await s.deriveBits(info('topic'), hk, 128));
+  const key = await s.deriveKey(info('aead'), hk, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
   const id = [...idBits].map((b) => b.toString(16).padStart(2, '0')).join('');
-  return {
-    id,
-    /** 加密并绑定主题（附加数据），密文换到别的主题上也解不开 */
-    async seal(topic, obj) {
-      const iv = crypto.getRandomValues(new Uint8Array(12));
-      const ct = new Uint8Array(await subtle.encrypt({ name: 'AES-GCM', iv, additionalData: enc.encode(topic) }, key, enc.encode(JSON.stringify(obj))));
-      const out = new Uint8Array(12 + ct.length);
-      out.set(iv);
-      out.set(ct, 12);
-      return b64(out);
-    },
-    /** 解密；密钥不对、被篡改、格式不对都返回 null */
-    async open(topic, str) {
-      try {
-        const bytes = unb64(str);
-        if (bytes.length < 29) return null;
-        const pt = await subtle.decrypt({ name: 'AES-GCM', iv: bytes.subarray(0, 12), additionalData: enc.encode(topic) }, key, bytes.subarray(12));
-        const msg = JSON.parse(dec.decode(pt));
-        return msg && typeof msg === 'object' ? msg : null;
-      } catch {
-        return null;
-      }
-    },
-  };
+  return { code, id, seal: (topic, obj) => aeadSeal(key, topic, obj), open: (topic, str) => aeadOpen(key, topic, str) };
 }
 
-/** 订阅回调：逐条解密后按到达顺序处理（解密是异步的，不串行会乱序） */
-function sealedHandler(room, topic, fn) {
+/** ECDH 临时密钥对 */
+async function ecdhPair() {
+  const kp = await subtle().generateKey(EC, false, ['deriveBits']);
+  return { priv: kp.privateKey, pub: new Uint8Array(await subtle().exportKey('raw', kp.publicKey)) };
+}
+
+/**
+ * 一条连接的双向密钥：由 ECDH 共享秘密经 HKDF 派生，房主→客人、客人→房主各一把。
+ * 返回 { seal(topic,obj), open(topic,str) }：seal 用本方发送方向的密钥，open 用对方的
+ */
+async function linkCipher(role, myPriv, peerRaw, salt) {
+  const s = subtle();
+  const peer = await s.importKey('raw', peerRaw, EC, false, []);
+  const shared = await s.deriveBits({ name: 'ECDH', public: peer }, myPriv, 256);
+  const hk = await s.importKey('raw', shared, 'HKDF', false, ['deriveKey']);
+  const dir = (x) => s.deriveKey({ name: 'HKDF', hash: 'SHA-256', salt: enc.encode(salt), info: enc.encode(x) }, hk, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
+  const [h2c, c2h] = await Promise.all([dir('host->client'), dir('client->host')]);
+  const [tx, rx] = role === 'host' ? [h2c, c2h] : [c2h, h2c];
+  return { seal: (topic, obj) => aeadSeal(tx, topic, obj), open: (topic, str) => aeadOpen(rx, topic, str) };
+}
+
+/** 房主签名的握手内容：绑定房间、这次连接、客人与房主的临时公钥 */
+function transcript(roomId, cid, cn, clientPub, hostEph) {
+  return enc.encode(['bobing/v4/ack', roomId, cid, cn, b64(clientPub), b64(hostEph)].join('|'));
+}
+
+/** 订阅回调：逐条解密后按到达顺序处理（解密是异步的，不串行会乱序）。cipher 可以是 Promise */
+function sealedHandler(cipher, topic, fn) {
   let chain = Promise.resolve();
   return (payload, broker) => {
-    chain = chain.then(() => room.open(topic, payload)).then((msg) => msg && fn(msg, broker), () => {});
+    chain = chain
+      .then(() => cipher)
+      .then((c) => c.open(topic, payload))
+      .then((msg) => msg && fn(msg, broker), () => {});
   };
 }
 
@@ -320,16 +386,22 @@ export class Broker {
     if (this.online) this.raw(mqtt.subscribe(this.nextId(), topic));
   }
 
+  unsubscribe(topic) {
+    if (!this.subs.delete(topic)) return;
+    if (this.online) this.raw(mqtt.unsubscribe(this.nextId(), topic));
+  }
+
   /** lossy：离线时直接丢弃（摇骰画面、敲门这类会重复发送的消息） */
   publish(topic, payload, lossy = false) {
     if (this.online && this.raw(mqtt.publish(topic, payload))) return;
     if (!lossy && this.queue.length < 200) this.queue.push([topic, payload]);
   }
 
-  /** 加密后发布；加密是异步的，串成一条链保证按调用顺序发出 */
-  publishSealed(room, topic, obj, lossy = false) {
+  /** 加密后发布；加密是异步的，串成一条链保证按调用顺序发出。cipher 可以是 Promise */
+  publishSealed(cipher, topic, obj, lossy = false) {
     this.sealing = (this.sealing || Promise.resolve())
-      .then(() => room.seal(topic, obj))
+      .then(() => cipher)
+      .then((c) => c.seal(topic, obj))
       .then((payload) => !this.closedWs && this.publish(topic, payload, lossy), () => {});
   }
 
@@ -375,16 +447,17 @@ export class Broker {
  * 房主与一位客人之间的连接。先走服务器中转，协商成功后自动换成 WebRTC 直连。
  * 事件：data(msg) / close() / kind('relay'|'p2p') / resume()
  * 有序消息带序号，接收端按序交付（切换通道的瞬间两条路可能乱序）；lossy 消息不排队、可丢。
- * 中转封包都加密，并带 c（客人连接 id）、h（房主为这条连接生成的随机 id）、n（发送方递增计数）：
- * 不是这条连接的、计数没有变大的（重放）一律丢弃。直连通道本身有 DTLS 加密，不再重复加密。
+ * 中转封包用这条连接自己的密钥（ECDH 协商，见上）加密，并带递增计数 n，计数没有变大的（重放）丢弃。
+ * 直连通道本身有 DTLS 加密，其密钥指纹经这条加密连接交换，不再重复加密。
  */
 export class Link extends Emitter {
-  constructor({ role, room, cid, h, broker }) {
+  constructor({ role, cipher, cid, tx, rx, broker }) {
     super();
     this.role = role;
-    this.room = room;
+    this.cipher = cipher; // 可以是 Promise（房主还在生成密钥）
     this.cid = cid;
-    this.h = h;
+    this.tx = tx; // 发出的主题
+    this.rx = rx; // 收取的主题
     this.broker = broker;
     this.kind = 'relay';
     this.open = true;
@@ -398,7 +471,6 @@ export class Link extends Emitter {
     this.dc = null;
     this.upgradeFailed = false;
     this.cands = [];
-    this.topic = role === 'host' ? `${NS}/${room.id}/c/${cid}` : `${NS}/${room.id}/h`;
   }
 
   send(msg, { lossy = false } = {}) {
@@ -419,15 +491,14 @@ export class Link extends Emitter {
     this.relay(env, lossy);
   }
 
-  /** 经服务器发给对方：补上连接标识与计数后加密 */
-  relay(env, lossy = false, broker = this.broker) {
-    broker.publishSealed(this.room, this.topic, { ...env, c: this.cid, h: this.h, n: ++this.outN }, lossy);
+  /** 经服务器发给对方：补上计数后用连接密钥加密 */
+  relay(env, lossy = false) {
+    this.broker.publishSealed(this.cipher, this.tx, { ...env, n: ++this.outN }, lossy);
   }
 
-  /** 服务器转来的封包（已解密）：校验属于这条连接且不是重放 */
+  /** 服务器转来的封包（已用连接密钥解密）：丢弃重放 */
   accept(env) {
-    if (!this.open || env.c !== this.cid || env.h !== this.h) return false;
-    if (!Number.isSafeInteger(env.n) || env.n <= this.inN) return false;
+    if (!this.open || !Number.isSafeInteger(env.n) || env.n <= this.inN) return false;
     this.inN = env.n;
     this.recv(env);
     return true;
@@ -569,30 +640,39 @@ export class Link extends Emitter {
   }
 }
 
+const topics = (roomId, cid) => ({
+  host: `${NS}/${roomId}/h`, // 敲门（房间密钥）
+  all: `${NS}/${roomId}/all`, // 房主广播（房间密钥 + 房主签名）
+  ack: `${NS}/${roomId}/a/${cid}`, // 应答（房间密钥 + 房主签名）
+  up: `${NS}/${roomId}/u/${cid}`, // 客人 → 房主（连接密钥）
+  down: `${NS}/${roomId}/d/${cid}`, // 房主 → 客人（连接密钥）
+});
+
 /**
  * 房主：在所有服务器上监听房间，每位客人（每次连接）得到一个 Link。
  * 客人发来第一条正式消息之前，连接不固定在某台服务器：敲门从哪台来，就在哪台应答
  * （客人可能在收到应答前断开了那台，换另一台继续敲）；第一条消息从哪台来，就固定用哪台。
  */
 export class HostHub {
-  constructor(code, onLink, urls = BROKERS) {
-    this.code = code;
+  constructor(onLink, { urls = BROKERS, makeBroker = (u) => new Broker(u) } = {}) {
     this.onLink = onLink;
     this.links = new Map(); // cid -> Link
     this.dead = new Set(); // 已关闭的连接 id：重放的旧敲门不会再建连接
-    this.hid = token(12); // 本房间广播用的 id
     this.bn = 0; // 广播计数
-    this.brokers = urls.map((u) => new Broker(u));
+    this.signing = Promise.resolve();
+    this.brokers = urls.map(makeBroker);
   }
 
-  /** 至少一台服务器连上即可开房；其余的在后台继续重试 */
+  /** 生成房主身份与房间号；至少一台服务器连上即可开房，其余的在后台继续重试 */
   async start(timeoutMs = 12000) {
+    this.identity = await createHostIdentity();
+    this.code = this.identity.code;
     this.room = await deriveRoom(this.code);
-    const topic = `${NS}/${this.room.id}/h`;
+    const t = topics(this.room.id, '');
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => reject({ type: 'network' }), timeoutMs);
       for (const b of this.brokers) {
-        b.subscribe(topic, sealedHandler(this.room, topic, (env, br) => this.onEnvelope(env, br)));
+        b.subscribe(t.host, sealedHandler(this.room, t.host, (env, br) => this.onKnock(env, br)));
         let first = true;
         b.onOnline = () => {
           if (first) {
@@ -607,48 +687,75 @@ export class HostHub {
     });
   }
 
-  onEnvelope(env, broker) {
+  onKnock(env, broker) {
+    if (env.k !== 'knock' || typeof env.cn !== 'string' || typeof env.pk !== 'string') return;
     const cid = typeof env.c === 'string' ? env.c.slice(0, 32) : '';
     if (!cid || this.dead.has(cid)) return;
     let link = this.links.get(cid);
-    if (env.k === 'knock') {
-      if (typeof env.cn !== 'string') return;
-      if (!link) {
-        if (this.links.size >= MAX_LINKS) return;
-        link = new Link({ role: 'host', room: this.room, cid, h: token(12), broker });
-        link.hid = this.hid;
-        this.links.set(cid, link);
-        link.on('close', () => {
-          clearTimeout(link.idleTimer);
-          if (this.links.get(cid) === link) this.links.delete(cid);
-          this.dead.add(cid);
-          if (this.dead.size > 500) this.dead.delete(this.dead.values().next().value);
-        });
-        // 敲了门却一直不来正式消息（客人放弃了，或是重放）：到时清掉
-        link.idleTimer = setTimeout(() => !link.pinned && link.close(false), 20000);
-        this.onLink(link);
-      }
-      if (link.pinned && link.broker !== broker) return;
-      // 应答可能丢了，客人会重复敲门：每次都回；cn 是客人这次的随机数，证明应答是新的
-      link.relay({ k: 'ack', cn: env.cn, u: this.hid }, true, broker);
-      return;
+    // 同一连接 id 换了公钥：不是同一个人，不理
+    if (link && link.pk !== env.pk) return;
+    if (!link) {
+      if (this.links.size >= MAX_LINKS) return;
+      link = this.createLink(cid, env, broker);
+      if (!link) return;
     }
-    if (!link || (link.pinned && link.broker !== broker)) return;
-    if (!link.pinned) {
-      const prev = link.broker;
-      link.broker = broker;
-      if (!link.accept(env)) {
-        link.broker = prev;
-        return;
-      }
-      link.pinned = true;
-      clearTimeout(link.idleTimer);
-      return;
-    }
-    link.accept(env);
+    if (link.pinned && link.broker !== broker) return;
+    // 应答可能丢了，客人会重复敲门：每次都回同一份
+    link.ackBody.then((body) => link.open && broker.publishSealed(this.room, link.t.ack, body, true), () => {});
   }
 
-  /** 摇骰画面这类高频消息：直连的逐个发，中转的每台服务器只发一次（客人订阅同一个广播主题） */
+  createLink(cid, env, broker) {
+    let clientPub;
+    try {
+      clientPub = unb64(env.pk);
+    } catch {
+      return null;
+    }
+    const t = topics(this.room.id, cid);
+    const hs = (async () => {
+      const eph = await ecdhPair();
+      const cipher = await linkCipher('host', eph.priv, clientPub, `${this.room.id}|${cid}`);
+      const sig = new Uint8Array(await subtle().sign(SIG_ALG, this.identity.key, transcript(this.room.id, cid, env.cn, clientPub, eph.pub)));
+      return { cipher, ack: { k: 'ack', c: cid, cn: env.cn, hk: b64(this.identity.pub), he: b64(eph.pub), sig: b64(sig) } };
+    })();
+    const cipher = hs.then((x) => x.cipher);
+    const link = new Link({ role: 'host', cipher, cid, tx: t.down, rx: t.up, broker });
+    link.pk = env.pk;
+    link.t = t;
+    link.ackBody = hs.then((x) => x.ack);
+    cipher.catch(() => link.close(false)); // 客人给的公钥无效
+    this.links.set(cid, link);
+    // 收客人的消息：在所有服务器上都订阅，第一条正式消息决定固定用哪台
+    const onUp = sealedHandler(cipher, t.up, (e, br) => this.onLinkEnv(link, e, br));
+    for (const b of this.brokers) b.subscribe(t.up, onUp);
+    link.on('close', () => {
+      clearTimeout(link.idleTimer);
+      for (const b of this.brokers) b.unsubscribe(t.up);
+      if (this.links.get(cid) === link) this.links.delete(cid);
+      this.dead.add(cid);
+      if (this.dead.size > 500) this.dead.delete(this.dead.values().next().value);
+    });
+    // 敲了门却一直不来正式消息（客人放弃了，或是重放）：到时清掉
+    link.idleTimer = setTimeout(() => !link.pinned && link.close(false), 20000);
+    this.onLink(link);
+    return link;
+  }
+
+  onLinkEnv(link, env, broker) {
+    if (!link.open || (link.pinned && link.broker !== broker)) return;
+    if (link.pinned) return link.accept(env);
+    const prev = link.broker;
+    link.broker = broker;
+    link.pinned = true;
+    if (!link.accept(env)) {
+      link.pinned = false;
+      link.broker = prev;
+      return;
+    }
+    clearTimeout(link.idleTimer);
+  }
+
+  /** 摇骰画面这类高频消息：直连的逐个发，中转的每台服务器只发一次（客人订阅同一个广播主题，房主签名防伪造） */
   broadcastLossy(msg, exceptCid) {
     const now = Date.now();
     const viaRelay = new Set();
@@ -659,8 +766,13 @@ export class HostHub {
     }
     if (!viaRelay.size || now - (this.lastLossy || 0) < LOSSY_RELAY_MS) return;
     this.lastLossy = now;
-    const env = { k: 'd', m: msg, u: this.hid, n: ++this.bn };
-    for (const b of viaRelay) b.publishSealed(this.room, `${NS}/${this.room.id}/all`, env, true);
+    const body = JSON.stringify({ n: ++this.bn, m: msg });
+    const topic = topics(this.room.id, '').all;
+    this.signing = this.signing
+      .then(() => subtle().sign(SIG_ALG, this.identity.key, enc.encode(body)))
+      .then((sig) => {
+        for (const b of viaRelay) b.publishSealed(this.room, topic, { k: 'b', b: body, sig: b64(new Uint8Array(sig)) }, true);
+      }, () => {});
   }
 
   close() {
@@ -671,58 +783,69 @@ export class HostHub {
 }
 
 /**
- * 客人：向所有服务器敲门，谁先应答就用谁
+ * 客人：向所有服务器敲门，谁先回来一份验证通过的应答就用谁
  * 失败时 reject {type:'no-room'}（服务器连上了但房主没回应）或 {type:'network'}（一台服务器都连不上）
  */
-export async function joinRoom(code, { timeoutMs = 12000, urls = BROKERS } = {}) {
+export async function joinRoom(code, { timeoutMs = 12000, urls = BROKERS, makeBroker = (u) => new Broker(u) } = {}) {
   const room = await deriveRoom(code);
+  const eph = await ecdhPair();
   const cid = token(12);
   const cn = token(12);
-  const hostTopic = `${NS}/${room.id}/h`;
-  const myTopic = `${NS}/${room.id}/c/${cid}`;
-  const allTopic = `${NS}/${room.id}/all`;
-  const brokers = urls.map((u) => new Broker(u));
+  const t = topics(room.id, cid);
+  const brokers = urls.map(makeBroker);
   return new Promise((resolve, reject) => {
     let done = false;
-    let link = null;
     let knockTimer = null;
     let giveUp = null;
-    const knock = (b) => b.publishSealed(room, hostTopic, { k: 'knock', c: cid, cn }, true);
+    const knockBody = { k: 'knock', c: cid, cn, pk: b64(eph.pub) };
+    const knock = (b) => b.publishSealed(room, t.host, knockBody, true);
     const finish = () => {
       done = true;
       clearInterval(knockTimer);
       clearTimeout(giveUp);
       for (const b of brokers) b.onOnline = null;
     };
+    /** 应答必须：回应本次随机数；房主公钥的指纹等于房间号；握手内容有房主签名 */
+    const verify = async (env) => {
+      if (env.k !== 'ack' || env.c !== cid || env.cn !== cn) return null;
+      const hk = unb64(String(env.hk));
+      const he = unb64(String(env.he));
+      if ((await codeFromKey(hk)) !== code) return null;
+      const pub = await subtle().importKey('raw', hk, SIG, false, ['verify']);
+      if (!(await subtle().verify(SIG_ALG, pub, unb64(String(env.sig)), transcript(room.id, cid, cn, eph.pub, he)))) return null;
+      return { pub, cipher: await linkCipher('client', eph.priv, he, `${room.id}|${cid}`) };
+    };
+    const bind = (br, { pub, cipher }) => {
+      finish();
+      for (const other of brokers) if (other !== br) other.stop();
+      br.unsubscribe(t.ack);
+      const link = new Link({ role: 'client', cipher, cid, tx: t.up, rx: t.down, broker: br });
+      link.on('close', () => br.stop());
+      br.subscribe(t.down, sealedHandler(cipher, t.down, (e) => link.accept(e)));
+      // 中转模式下，房主把摇骰画面发到房间广播主题：验签、计数递增才收
+      let bn = 0;
+      br.subscribe(
+        t.all,
+        sealedHandler(room, t.all, async (e) => {
+          if (e.k !== 'b' || typeof e.b !== 'string') return;
+          if (!(await subtle().verify(SIG_ALG, pub, unb64(String(e.sig)), enc.encode(e.b)))) return;
+          const body = JSON.parse(e.b);
+          if (!Number.isSafeInteger(body.n) || body.n <= bn) return;
+          bn = body.n;
+          if (link.kind === 'relay' && link.open) link.emit('data', body.m);
+        }),
+      );
+      br.onOnline = () => link.resume();
+      resolve(link);
+      setTimeout(() => link.upgrade(), 300);
+    };
     for (const b of brokers) {
       b.subscribe(
-        myTopic,
-        sealedHandler(room, myTopic, (env, br) => {
-          if (done) {
-            if (br === link?.broker) link.accept(env);
-            return;
-          }
-          // 应答必须回应本次的随机数（旧应答重放无效）
-          if (env.k !== 'ack' || env.c !== cid || env.cn !== cn || typeof env.h !== 'string' || !Number.isSafeInteger(env.n)) return;
-          finish();
-          for (const other of brokers) if (other !== br) other.stop();
-          link = new Link({ role: 'client', room, cid, h: env.h, broker: br });
-          link.inN = env.n;
-          link.on('close', () => br.stop());
-          // 中转模式下，房主把摇骰画面发到房间广播主题（同样加密，带递增计数）
-          const hid = String(env.u || '');
-          let bn = 0;
-          br.subscribe(
-            allTopic,
-            sealedHandler(room, allTopic, (e) => {
-              if (e.k !== 'd' || e.u !== hid || !Number.isSafeInteger(e.n) || e.n <= bn) return;
-              bn = e.n;
-              if (link.kind === 'relay' && link.open) link.emit('data', e.m);
-            }),
-          );
-          br.onOnline = () => link.resume();
-          resolve(link);
-          setTimeout(() => link.upgrade(), 300);
+        t.ack,
+        sealedHandler(room, t.ack, async (env, br) => {
+          if (done) return;
+          const ok = await verify(env).catch(() => null);
+          if (ok && !done) bind(br, ok);
         }),
       );
       b.onOnline = knock;
