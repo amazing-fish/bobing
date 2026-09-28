@@ -405,19 +405,23 @@ function setupGame() {
 
 // ---------- 手机体感摇骰 ----------
 // 手机上不再用手指按住拖动（容易触发长按菜单、误触即掷出）。两种方式：
-// 1) 一键掷骰；2) 开启体感后，轮到你时直接晃手机：一晃就把骰子抓进掌心，晃动推着掌心走，
-//    停下来就顺势掷出（也可以点"掷出"）。不需要按住屏幕。
+// 1) 一键掷骰；2) 开启体感后，轮到你时直接晃手机：一晃就把骰子抓进掌心，晃动推着掌心走；
+//    摇的过程中猛地一甩就立即掷出，力度随甩的猛烈程度；或者停下来顺势轻抛（也可以点"掷出"）。不需要按住屏幕。
 const TOUCH = matchMedia('(pointer: coarse)').matches;
 const SHAKE_START = 6; // 晃动强度（m/s²，平滑后）超过它才开始，避免拿起手机时误触发
-const SHAKE_CALM = 2.5; // 低于它持续 CALM_MS 视为停下
-const CALM_MS = 350;
-const SHAKE_MIN_MS = 700; // 至少摇这么久才会自动掷出
+const SHAKE_CALM = 3; // 低于它持续 CALM_MS 视为停下
+const CALM_MS = 220;
+const SHAKE_MIN_MS = 500; // 至少摇这么久才会因为停下而自动掷出
 const SHAKE_MAX_MS = 6000;
-let motion = { on: false, a: null, t: 0, energy: 0, peak: 0, calmSince: 0 };
+// 甩出：瞬时加速度同时超过 FLICK_MIN，且是此前晃动强度的 FLICK_RATIO 倍（区别于持续的来回摇）
+const FLICK_MIN = 20;
+const FLICK_RATIO = 2.2;
+const FLICK_AFTER_MS = 300; // 刚抓起时的晃动不算甩
+let motion = { on: false, a: null, t: 0, energy: 0, peak: 0, calmSince: 0, flick: 0 };
 
 function motionHint() {
   if (!TOUCH) return '在碗上<b>按住</b>抓起骰子 → <b>拖动</b>摇一摇 → <b>甩一下松手</b>';
-  return motion.on ? '<b>晃动手机</b>摇骰子，<b>停下</b>就掷出' : '点<b>一键掷骰</b>，或开启<b>体感摇骰</b>后晃手机';
+  return motion.on ? '<b>晃动手机</b>摇骰子，<b>猛地一甩</b>掷出（停下也会轻抛）' : '点<b>一键掷骰</b>，或开启<b>体感摇骰</b>后晃手机';
 }
 
 function setupMotion() {
@@ -472,33 +476,48 @@ function setupMotion() {
     motion.t = now;
     // 晃动强度：加速度大小的指数平均（约 0.15 秒）
     const mag = Math.hypot(motion.a.x, motion.a.y, motion.a.z);
+    const before = motion.energy;
     motion.energy += (mag - motion.energy) * Math.min(1, dt / 0.15);
-    onShake(now);
+    onShake(now, mag, before);
   });
 }
 
-/** 由晃动强度决定：开始摇（抓起骰子）→ 摇动中 → 停下（掷出） */
-function onShake(now) {
+/** 由晃动决定：开始摇（抓起骰子）→ 摇动中 → 甩出 / 停下（掷出） */
+function onShake(now, mag, before) {
   const e = motion.energy;
   if (!grab) {
     if (e > SHAKE_START && canGrab() && !document.querySelector('dialog[open]')) startShakeGrab();
     return;
   }
   if (grab.kind !== 'shake') return;
+  const held = now - grab.t0;
+  if (held > FLICK_AFTER_MS && mag > FLICK_MIN && mag > before * FLICK_RATIO) {
+    motion.flick = mag;
+    return releaseGrab('flick');
+  }
   motion.peak = Math.max(motion.peak, e);
   if (e > SHAKE_CALM) motion.calmSince = 0;
   else motion.calmSince ||= now;
-  const held = now - grab.t0;
-  if ((held > SHAKE_MIN_MS && motion.calmSince && now - motion.calmSince > CALM_MS) || held > SHAKE_MAX_MS) releaseGrab();
+  if (held > SHAKE_MIN_MS && motion.calmSince && now - motion.calmSince > CALM_MS) releaseGrab('calm');
+  else if (held > SHAKE_MAX_MS) releaseGrab('calm');
 }
 
 function startShakeGrab() {
   unlockAudio();
   motion.peak = motion.energy;
   motion.calmSince = 0;
+  motion.flick = 0;
   navigator.vibrate?.(30);
-  // 掌心停在碗心上方，晃动推着它走，弹簧把它拉回来
-  startGrab(null, { x: 0, z: 0 }, 'shake');
+  // 掌心从碗心附近随机一点起手，晃动推着它走；弹簧的锚点也会慢慢游走（见 tickHand），每次出手位置都不同
+  startGrab(null, wanderPoint(), 'shake');
+}
+
+/** 碗心附近的随机一点（半径 WANDER_R 内） */
+const WANDER_R = 5;
+function wanderPoint() {
+  const a = Math.random() * Math.PI * 2;
+  const r = WANDER_R * Math.sqrt(Math.random());
+  return { x: Math.cos(a) * r, z: Math.sin(a) * r };
 }
 
 /** 把手机加速度（设备坐标，m/s²）换算成掌心在世界坐标里受到的加速度（cm/s²） */
@@ -519,12 +538,21 @@ function motionToWorld() {
   };
 }
 
-/** 体感摇完停下时，手已经几乎不动了：补一个朝碗对面的轻抛，力度随刚才摇得多猛 */
-function shakeToss() {
-  const k = Math.min(1, Math.max(0, (motion.peak - SHAKE_START) / 12));
-  const az = stage.cam.az; // 镜头在玩家身后，朝碗心方向 = -(cos az, sin az)
-  const sp = 45 + 45 * k;
-  return { x: -Math.cos(az) * sp, z: -Math.sin(az) * sp };
+/**
+ * 体感出手时补的水平抛出速度：大致朝碗对面（远离玩家），方向随机偏转。
+ * 甩出：力度随甩的猛烈程度，甩得太猛会出碗；停下：轻抛，力度随刚才摇得多猛
+ */
+function shakeToss(how) {
+  const flick = how === 'flick';
+  const k = flick
+    ? Math.min(1, Math.max(0, (motion.flick - FLICK_MIN) / 25))
+    : Math.min(1, Math.max(0, (motion.peak - SHAKE_START) / 12));
+  const sp = flick ? 25 + 55 * k : 35 + 40 * k;
+  const spread = flick ? 0.5 : 0.9; // 弧度
+  // 镜头在玩家身后，朝碗心方向 = -(cos az, sin az)
+  const az = stage.cam.az + (Math.random() * 2 - 1) * spread;
+  const j = 0.85 + Math.random() * 0.3;
+  return { x: -Math.cos(az) * sp * j, z: -Math.sin(az) * sp * j };
 }
 
 function renderGame(st) {
@@ -664,7 +692,7 @@ function lockThrow() {
     timer: setTimeout(() => {
       awaiting = null;
       hand.stop();
-      stage.setLive(null);
+      stage.settle();
       flashMsg('房主没有响应，请再试一次');
       updateThrowButton();
     }, 7000),
@@ -681,13 +709,26 @@ function startGrab(pointerId, xz, kind = 'drag') {
   stage.setLive(hand.frame, true);
   const cur = view.players[view.turn];
   const who = session.mode === 'local' ? cur.name : '你';
-  $('turn-banner').textContent = kind === 'shake' ? `${who}：摇啊摇，停下就掷出` : `${who}：摇一摇，甩出去`;
+  $('turn-banner').textContent = kind === 'shake' ? `${who}：摇啊摇，甩一下掷出` : `${who}：摇一摇，甩出去`;
   updateThrowButton();
 }
 
 function tickHand(dt) {
   if (!hand.active) return;
-  if (hand.mode === 'hold') hand.setExternal(grab?.kind === 'shake' ? motionToWorld() : null);
+  if (hand.mode === 'hold' && grab?.kind === 'shake') {
+    hand.setExternal(motionToWorld());
+    // 掌心的锚点慢慢游走：停下时落在哪儿、朝哪儿抛都带点随机
+    const now = performance.now();
+    if (now > (grab.wanderAt ?? 0)) {
+      grab.wanderAt = now + 500 + Math.random() * 700;
+      grab.goal = wanderPoint();
+      grab.anchor ??= { x: hand.target.x, z: hand.target.z };
+    }
+    const k = Math.min(1, dt / 0.45);
+    grab.anchor.x += (grab.goal.x - grab.anchor.x) * k;
+    grab.anchor.z += (grab.goal.z - grab.anchor.z) * k;
+    hand.setTarget(grab.anchor);
+  } else if (hand.mode === 'hold') hand.setExternal(null);
   const sounds = hand.update(dt);
   for (const s of sounds) {
     playImpact(s.k, s.s);
@@ -703,7 +744,7 @@ function tickHand(dt) {
     // 体感：显示晃动强度；停在碗心上方，不会掉出碗外
     const k = Math.min(1, motion.energy / 18);
     $('power-fill').style.width = `${k * 100}%`;
-    $('power-label').textContent = motion.calmSince ? '停下了，掷出！' : k < 0.5 ? '摇啊摇…' : '摇得正欢，停下就掷出';
+    $('power-label').textContent = motion.calmSince ? '停下了，轻抛…' : k < 0.5 ? '摇啊摇…' : '摇得正欢，甩一下掷出';
     return sendHold();
   }
   const sp = hand.speed01();
@@ -721,29 +762,42 @@ function sendHold() {
   session.sendHold({ f: encodeFrames(hand.frame), s: grab.sounds.splice(0, 8) });
 }
 
-function releaseGrab() {
+/** how：体感摇骰的出手方式 'flick' 甩出 | 'calm' 停下 | 'button' 点按钮 */
+function releaseGrab(how = 'button') {
   if (!grab) return;
   clearTimeout(grab.timer);
-  const toss = grab.kind === 'shake' ? shakeToss() : null;
+  const toss = grab.kind === 'shake' ? shakeToss(how) : null;
+  if (grab.kind === 'shake') navigator.vibrate?.(how === 'flick' ? 40 : 20);
   grab = null;
-  const init = hand.release(toss);
+  const rel = hand.release(toss);
   stage.setAim(null);
-  if (!init) return updateThrowButton();
-  // 松手后继续本地预测（骰子立即飞出），同时请求房主给出权威结果
-  stage.setLive(hand.frame, false);
+  if (!rel) return updateThrowButton();
+  // 本机只预演到骰子碰碗之前：碰撞之后本机与房主的仿真会分叉（结果对不上），
+  // 所以在碗上方减速悬停，等房主的权威轨迹接上，之后看到的每一帧都与其他人一致
+  stage.playPrelude(rel.pre);
   lockThrow();
-  session.throwDice({ init: init.map((v) => Math.round(v * 1000) / 1000) });
+  session.throwDice({ init: rel.init.map((v) => Math.round(v * 1000) / 1000) });
+  clearTimeout(judgeHint);
+  judgeHint = setTimeout(() => {
+    if (awaiting && stage.pre) $('turn-banner').textContent = '等待房主判定…';
+  }, 700);
 }
+let judgeHint = 0;
 
 // ---------- 回放与结果 ----------
+let rollGen = 0;
 async function playRoll(roll) {
+  const gen = ++rollGen;
   animating = true;
   pendingState = null;
+  clearTimeout(judgeHint);
   $('toast').hidden = true;
-  // 本机刚松手：从已预测的进度接上权威轨迹；观战者从最后看到的摇骰画面接上
-  const mine = !!awaiting && roll.mode === 'init';
+  // 本机刚松手、预演悬停在碗上方：从预演停下的那一刻接上权威轨迹，速率由慢到快；
+  // 观战者从最后看到的摇骰画面接上。必须确认这一掷确实是自己的（投掷请求可能被房主丢弃）
+  const clock = stage.preludeClock();
+  const mine = !!awaiting && !!clock && roll.mode === 'init' && (session?.mode === 'local' || roll.outcome.playerId === session?.meId);
   const opts = mine
-    ? { startAt: Math.min(roll.duration, (performance.now() - awaiting.t) / 1000), blend: 180 }
+    ? { startAt: Math.min(roll.duration, clock.t), rate0: clock.rate, ramp: 300, blend: 150 }
     : roll.mode === 'init'
       ? { blend: 200 }
       : { lead: PICKUP_MS, blend: PICKUP_MS, arc: true };
@@ -761,6 +815,8 @@ async function playRoll(roll) {
   const throwerAz = roll.before ? seatAz(roll.before, roll.outcome.playerId) : stage.cam.az;
   stage.setShot({ kind: 'seat', az: throwerAz }, 900);
   await stage.playRoll(roll, (ev) => playImpact(ev.k, ev.s), opts);
+  // 回放中又来了下一掷（网络慢的一端可能收到重叠的结果）：旧的收尾交给新的
+  if (gen !== rollGen) return;
   // 骰子停稳：推近俯看点数
   stage.setShot({ kind: 'result', az: throwerAz }, 1000);
   const info = describe(roll.outcome, roll.outMask);
@@ -769,6 +825,7 @@ async function playRoll(roll) {
   else playFail();
   if (info.level === 2) confetti();
   await wait(2000);
+  if (gen !== rollGen) return;
   animating = false;
   render(pendingState || roll.after);
   pendingState = null;

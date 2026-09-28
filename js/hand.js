@@ -1,15 +1,18 @@
-// 实时摇骰：在投掷者本机运行物理，手跟随指针移动，骰子在掌心里真实碰撞；
-// 松手后继续本地预测，直到房主的权威结果到达再平滑衔接
-import { PhysWorld, HAND, STRIDE, mulberry32, tiltQuat, BOWL } from './physics.js';
+// 实时摇骰：在投掷者本机运行物理，手跟随指针移动，骰子在掌心里真实碰撞。
+// 松手后只预演到骰子第一次碰碗之前：碰撞是混沌的，本机与房主的仿真在碰碗后约 0.1 秒就完全分叉
+// （实测 scripts/diag-drift.mjs），之后的画面必须以房主的权威轨迹为准
+import { PhysWorld, HAND, STRIDE, mulberry32, tiltQuat, BOWL, KIND, RECORD_FPS } from './physics.js';
 
 const HOLD_DT = 1 / 240;
 const OMEGA = 28; // 手跟随指针的弹簧频率（临界阻尼）
 const VOMEGA = 22; // 掌心上下晃动的弹簧频率
+const PRE_MAX = 0.6; // 松手后最多预演多久
+const PRE_MARGIN = 1 / 60; // 停在碰碗前这么久
 
 export class HandController {
   constructor() {
     this.pw = null;
-    this.mode = 'idle'; // idle | hold | predict
+    this.mode = 'idle'; // idle | hold
     this.frame = new Float32Array(STRIDE);
     this.acc = 0;
   }
@@ -57,12 +60,6 @@ export class HandController {
         this.stepHand();
         this.pw.step(HOLD_DT, onSound);
         this.pw.contain();
-      }
-    } else if (this.mode === 'predict') {
-      const dt = this.pw.T.dt;
-      while (this.acc >= dt) {
-        this.acc -= dt;
-        this.pw.step(dt, onSound);
       }
     }
     this.pw.writeFrame(this.frame);
@@ -114,14 +111,16 @@ export class HandController {
   }
 
   /**
-   * 松手：返回交给房主的初始状态（6 × [p,q,v,w]）
-   * toss：额外的水平抛出速度（cm/s）。体感摇骰停下时手几乎静止，用它补一个轻抛，每颗骰子略有差异
+   * 松手：返回 { init, pre }。init 是交给房主的初始状态（6 × [p,q,v,w]）；
+   * pre 是本机预演的开头一段轨迹 { frames, fps, holdAt }：骰子飞出、落到碗上方，holdAt（秒）停在第一次碰碗/桌之前。
+   * toss：额外的水平抛出速度（cm/s），每颗骰子略有差异
    */
   release(toss = null) {
     if (this.mode !== 'hold') return null;
-    this.pw.release({ x: this.vel.x, y: 0, z: this.vel.z });
+    const pw = this.pw;
+    pw.release({ x: this.vel.x, y: 0, z: this.vel.z });
     if (toss) {
-      for (const b of this.pw.dice) {
+      for (const b of pw.dice) {
         const v = b.linvel();
         const j = 0.8 + Math.random() * 0.4;
         b.setLinvel({ x: v.x + toss.x * j + (Math.random() - 0.5) * 12, y: v.y, z: v.z + toss.z * j + (Math.random() - 0.5) * 12 }, true);
@@ -129,9 +128,25 @@ export class HandController {
         b.setAngvel({ x: w.x + (Math.random() - 0.5) * 30, y: w.y + (Math.random() - 0.5) * 30, z: w.z + (Math.random() - 0.5) * 30 }, true);
       }
     }
-    this.mode = 'predict';
-    this.acc = 0;
-    return this.pw.getState();
+    const init = pw.getState();
+    // 预演：记录 60fps 帧，直到第一次碰到碗或桌面（最多 PRE_MAX 秒）
+    const dt = pw.T.dt;
+    const fdt = 1 / RECORD_FPS;
+    const list = [pw.writeFrame(new Float32Array(STRIDE))];
+    let hit = Infinity;
+    const onSound = (e) => {
+      if (e.k === KIND.bowl || e.k === KIND.table) hit = Math.min(hit, e.t);
+    };
+    const t0 = pw.t;
+    while (hit === Infinity && pw.t - t0 < PRE_MAX) {
+      pw.step(dt, onSound);
+      if (pw.t - t0 >= list.length * fdt - 1e-9) list.push(pw.writeFrame(new Float32Array(STRIDE)));
+    }
+    const tHit = Math.min(PRE_MAX, hit - t0);
+    const frames = new Float32Array(list.length * STRIDE);
+    list.forEach((f, i) => frames.set(f, i * STRIDE));
+    this.stop();
+    return { init, pre: { frames, fps: RECORD_FPS, holdAt: Math.max(0, tHit - PRE_MARGIN) } };
   }
 
   stop() {

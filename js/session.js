@@ -442,12 +442,18 @@ export class ClientSession extends Emitter {
     if (this.closed) return link.close();
     this.link = link;
     this.lastMsg = Date.now();
+    // 每次连接各自等待欢迎：重连循环可能已经换上了新连接，旧连接的失败不能波及它
+    let wait;
     const welcome = new Promise((resolve, reject) => {
-      this.welcomeWait = { resolve, reject };
+      wait = this.welcomeWait = { resolve, reject };
       setTimeout(() => reject({ type: 'timeout' }), 10000);
     });
     link.on('data', (msg) => link === this.link && this.onMsg(msg));
-    link.on('close', () => link === this.link && this.dropped());
+    link.on('close', () => {
+      if (link !== this.link) return;
+      if (this.welcomeWait === wait) return wait.reject({ type: 'network' });
+      this.dropped();
+    });
     link.on('kind', () => link === this.link && this.emit('net', this.status));
     link.on('resume', () => {
       if (link !== this.link) return;
@@ -462,12 +468,12 @@ export class ClientSession extends Emitter {
     try {
       await welcome;
     } catch (e) {
-      this.link = null;
+      if (this.link === link) this.link = null;
       link.close();
       throw e;
     } finally {
       clearInterval(retry);
-      this.welcomeWait = null;
+      if (this.welcomeWait === wait) this.welcomeWait = null;
     }
     this.setStatus('online');
   }
