@@ -1,24 +1,20 @@
 // 会话层：房主端权威运行对局与物理，客户端只发送"投掷"请求并回放房主广播的轨迹。
-// 联机基于 PeerJS（WebRTC 点对点，信令用 PeerJS 公共服务器），无需自建后端，适合 GitHub Pages。
+// 传输见 net.js：公共 MQTT 服务器负责找房间与兜底中转，能直连时自动升级为 WebRTC，无需自建后端。
 import { BobingGame } from './game.js';
 import { encodeFrames, decodeFrames, PICKUP_MS, STRIDE } from './physics.js';
 import { runSim, warmSim } from './sim-runner.js';
+import { Emitter, HostHub, joinRoom, CODE_CHARS, CODE_LEN } from './net.js';
 
-export const PEER_PREFIX = 'bobing-cn-';
+export { CODE_LEN };
+
 const SEATS = 8;
 const REVEAL_MS = 2200; // 骰子停稳后展示结果的时间
-const CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-const PEER_OPTS = {
-  debug: 1,
-  config: {
-    iceServers: [
-      { urls: 'stun:stun.miwifi.com:3478' },
-      { urls: 'stun:stun.cloudflare.com:3478' },
-      { urls: 'stun:stun.l.google.com:19302' },
-      { urls: ['turn:eu-0.turn.peerjs.com:3478', 'turn:us-0.turn.peerjs.com:3478'], username: 'peerjs', credential: 'peerjsp' },
-    ],
-  },
-};
+const PING_MS = 3000;
+const SILENT_MS = 20000; // 这么久收不到对方任何消息，认为连接已断
+const SUSPEND_MS = 8000; // 本机计时器停摆这么久（锁屏、切后台），说明是自己睡着了，不怪对方
+const GRACE_MS = 30000; // 客人断线后保留座位多久（期间重连不打扰对局）
+const RECONNECT_MS = 90000; // 客人自动重连的最长时间
+const HELLO_RETRY_MS = 2000; // 入座请求走的是可丢的通道：没等到欢迎就重发
 const BOT_NAMES = ['阿福', '小月', '桂花', '团圆', '玉兔', '嫦娥', '吴刚', '招财'];
 
 export function randomCode(n = 5) {
@@ -29,21 +25,27 @@ export function randomCode(n = 5) {
   return s;
 }
 
+/** 用户输入/链接里的房间号 → 规范形式（去掉分隔符、转大写）；不合法返回 null */
+export function normalizeCode(s) {
+  const c = String(s || '').toUpperCase().replace(/[\s-]/g, '');
+  return c.length === CODE_LEN && [...c].every((ch) => CODE_CHARS.includes(ch)) ? c : null;
+}
+
+/** 展示用：ABCDE-FGHJK */
+export function formatCode(c) {
+  return c ? `${c.slice(0, 5)}-${c.slice(5)}` : '';
+}
+
 export function randomId() {
   return crypto.randomUUID ? crypto.randomUUID() : `id-${Date.now().toString(36)}-${randomCode(8)}`;
 }
 
-class Emitter {
-  constructor() {
-    this.handlers = {};
-  }
-  on(ev, fn) {
-    (this.handlers[ev] ??= []).push(fn);
-    return this;
-  }
-  emit(ev, ...args) {
-    for (const fn of this.handlers[ev] || []) fn(...args);
-  }
+/** 页面从后台回到前台时回调（Node 测试环境下什么也不做） */
+function onVisible(fn) {
+  if (typeof document === 'undefined') return () => {};
+  const h = () => document.visibilityState === 'visible' && fn();
+  document.addEventListener('visibilitychange', h);
+  return () => document.removeEventListener('visibilitychange', h);
 }
 
 /**
@@ -64,9 +66,17 @@ export class HostSession extends Emitter {
     this.busy = false;
     this.queued = null;
     this.seq = 0;
+    this.rev = 0; // 状态版本号：客人据此发现自己漏了消息
     this.botTimer = null;
     this.conns = new Map(); // playerId -> { conn, lastSeen }
-    this.peer = null;
+    this.grace = new Map(); // playerId -> 断线保留座位的计时器
+    // 玩家 id 是公开的（在对局状态里），所以每个 id 绑定一把只有本人知道的密钥：
+    // 客人第一次入座时绑定，之后凭同一把密钥才能以这个身份重连；房主、电脑、同屏玩家的 id 不接受外来入座
+    this.keys = new Map();
+    this.kicked = new Set(); // 被房主移出的玩家 id：本房间内不再接受（"已被移出"的通知可能丢了，客人会自动重连）
+    this.keys.set(me.id, null);
+    this.hub = null;
+    this.status = 'online';
   }
 
   get state() {
@@ -78,80 +88,122 @@ export class HostSession extends Emitter {
       this.emit('state', this.game.snapshot());
       return;
     }
-    for (let attempt = 0; attempt < 4; attempt++) {
-      const code = randomCode();
-      try {
-        this.peer = await openPeer(PEER_PREFIX + code);
-        this.code = code;
-        break;
-      } catch (e) {
-        if (e?.type !== 'unavailable-id' || attempt === 3) throw e;
-      }
-    }
+    this.hub = new HostHub((link) => this.onConn(link));
+    await this.hub.start();
+    this.code = this.hub.code;
     this.game.state.code = this.code;
-    this.peer.on('connection', (conn) => this.onConn(conn));
-    this.peer.on('disconnected', () => {
-      // 与信令服务器断开不影响已建立的连接，但新玩家无法加入，尝试重连
-      setTimeout(() => this.peer && !this.peer.destroyed && this.peer.reconnect(), 1500);
-    });
-    this.peer.on('error', (e) => this.emit('warn', friendlyError(e)));
-    this.presence = setInterval(() => this.checkPresence(), 4000);
+    this.lastTick = Date.now();
+    this.presence = setInterval(() => this.checkPresence(), PING_MS);
+    this.offVisible = onVisible(() => this.checkPresence());
     this.emit('state', this.game.snapshot());
   }
 
   close() {
+    if (this.closed) return;
     this.closed = true;
     clearTimeout(this.botTimer);
     clearTimeout(this.lockTimer);
     clearInterval(this.presence);
-    for (const { conn } of this.conns.values()) conn.close();
+    this.offVisible?.();
+    for (const t of this.grace.values()) clearTimeout(t);
+    for (const { conn } of this.conns.values()) {
+      if (conn.open) conn.send({ type: 'closed' });
+      conn.close();
+    }
     this.conns.clear();
-    this.peer?.destroy();
-    this.peer = null;
+    this.hub?.close();
+    this.hub = null;
   }
 
+  /** 新连接（net.js 的 Link，测试里是假连接）：收到 hello 之后才算入座 */
   onConn(conn) {
     conn.on('data', (msg) => this.onMsg(conn, msg));
     conn.on('close', () => this.onClose(conn));
-    conn.on('error', () => this.onClose(conn));
+    // 房主这边的服务器重连了：发个心跳，客人比对版本号，漏了就来要最新状态
+    conn.on('resume', () => conn.playerId && conn.send({ type: 'ping', rev: this.rev }));
   }
 
   onMsg(conn, msg) {
-    if (!msg || typeof msg !== 'object') return;
+    if (!msg || typeof msg !== 'object' || this.closed) return;
     if (msg.type === 'hello') {
       const id = String(msg.id || '').slice(0, 64);
       const name = String(msg.name || '玩家').slice(0, 12);
+      const key = typeof msg.key === 'string' ? msg.key.slice(0, 128) : '';
       if (!id) return;
+      if (this.kicked.has(id)) {
+        conn.send({ type: 'kicked' });
+        setTimeout(() => conn.close(), 300);
+        return;
+      }
+      // 冒用别人的 id（id 在对局状态里人人可见）：拒绝
+      if (key.length < 16 || (this.keys.has(id) && this.keys.get(id) !== key)) {
+        conn.send({ type: 'denied' });
+        setTimeout(() => conn.close(), 300);
+        return;
+      }
       const known = this.game.players.find((p) => p.id === id);
       if (!known && this.game.players.length >= SEATS) {
         conn.send({ type: 'full' });
         setTimeout(() => conn.close(), 300);
         return;
       }
+      this.keys.set(id, key);
       const old = this.conns.get(id);
-      if (old && old.conn !== conn) old.conn.close();
       conn.playerId = id;
       this.conns.set(id, { conn, lastSeen: Date.now() });
+      if (old && old.conn !== conn) old.conn.close();
+      const graced = this.grace.has(id);
+      clearTimeout(this.grace.get(id));
+      this.grace.delete(id);
+      const wasOnline = known?.online && (graced || old);
       this.game.addPlayer({ id, name });
-      this.game.pushLog(known ? `${name} 回到了牌桌` : `${name} 加入了房间`);
-      conn.send({ type: 'welcome', id, state: this.game.snapshot() });
+      // 短暂断线后重连：座位一直保留着，不刷屏
+      if (!wasOnline) this.game.pushLog(known ? `${name} 回到了牌桌` : `${name} 加入了房间`);
+      conn.send({ type: 'welcome', id, rev: this.rev, state: this.game.snapshot() });
       this.afterChange();
       return;
     }
     const id = conn.playerId;
     const entry = id && this.conns.get(id);
-    if (!entry) return;
+    if (!entry || entry.conn !== conn) return;
     entry.lastSeen = Date.now();
-    if (msg.type === 'throw') this.requestThrow(id, { init: msg.init, power: Number(msg.power) });
-    else if (msg.type === 'hold') this.relayHold(id, msg);
+    switch (msg.type) {
+      case 'ping':
+        conn.send({ type: 'pong', rev: this.rev });
+        break;
+      case 'sync':
+        conn.send({ type: 'state', rev: this.rev, state: this.game.snapshot() });
+        break;
+      case 'leave':
+        conn.leaving = true;
+        conn.close();
+        break;
+      case 'throw':
+        this.requestThrow(id, { init: msg.init, power: Number(msg.power) });
+        break;
+      case 'hold':
+        this.relayHold(id, msg);
+        break;
+    }
   }
 
   onClose(conn) {
     const id = conn.playerId;
     if (!id || this.conns.get(id)?.conn !== conn) return;
     this.conns.delete(id);
+    if (!this.game.players.some((p) => p.id === id)) return;
+    // 主动离开立即下线；意外断线先保留座位，给对方自动重连的时间
+    if (conn.leaving || this.closed) return this.dropPlayer(id);
+    clearTimeout(this.grace.get(id));
+    this.grace.set(id, setTimeout(() => this.dropPlayer(id), GRACE_MS));
+  }
+
+  dropPlayer(id) {
+    clearTimeout(this.grace.get(id));
+    this.grace.delete(id);
+    if (this.conns.has(id)) return;
     const p = this.game.players.find((x) => x.id === id);
-    if (!p) return;
+    if (!p || this.closed) return;
     // 对局中只标记离线并跳过其回合；大厅中直接移除
     this.game.removePlayer(id);
     this.game.pushLog(`${p.name} 离开了`);
@@ -160,9 +212,12 @@ export class HostSession extends Emitter {
 
   checkPresence() {
     const now = Date.now();
+    // 房主自己刚从锁屏/后台醒来：大家的消息都还没来得及到，重新计时而不是把所有人踢掉
+    if (now - (this.lastTick ?? now) > SUSPEND_MS) for (const e of this.conns.values()) e.lastSeen = now;
+    this.lastTick = now;
     for (const { conn, lastSeen } of this.conns.values()) {
-      if (now - lastSeen > 15000) conn.close();
-      else if (conn.open) conn.send({ type: 'ping' });
+      if (now - lastSeen > SILENT_MS) conn.close();
+      else if (conn.open) conn.send({ type: 'ping', rev: this.rev });
     }
   }
 
@@ -172,8 +227,9 @@ export class HostSession extends Emitter {
 
   afterChange() {
     const snap = this.game.snapshot();
+    this.rev++;
     this.emit('state', snap);
-    this.broadcast({ type: 'state', state: snap });
+    this.broadcast({ type: 'state', rev: this.rev, state: snap });
     this.scheduleBot();
   }
 
@@ -201,7 +257,14 @@ export class HostSession extends Emitter {
 
   /** 本机摇骰画面同步给其他人 */
   sendHold(h) {
-    if (this.mode === 'host') this.broadcast({ type: 'hold', ...h });
+    if (this.mode === 'host') this.fanoutHold({ type: 'hold', from: this.meId, f: h.f, s: sanitizeSounds(h.s) }, null);
+  }
+
+  /** 摇骰画面是高频消息：可丢、不排队；中转的客人共用一条广播 */
+  fanoutHold(msg, exceptId) {
+    const except = this.conns.get(exceptId)?.conn;
+    if (this.hub) return this.hub.broadcastLossy(msg, except?.cid);
+    for (const [id, { conn }] of this.conns) if (id !== exceptId && conn.open) conn.send(msg, { lossy: true });
   }
 
   /** 转发客户端的摇骰画面（只转发当前玩家的） */
@@ -217,7 +280,7 @@ export class HostSession extends Emitter {
     }
     if (frame.length !== STRIDE) return;
     const sounds = sanitizeSounds(msg.s);
-    for (const [id, { conn }] of this.conns) if (id !== fromId && conn.open) conn.send({ type: 'hold', f: msg.f, s: sounds });
+    this.fanoutHold({ type: 'hold', from: fromId, f: msg.f, s: sounds }, fromId);
     this.emit('hold', { frame, sounds });
   }
 
@@ -269,7 +332,8 @@ export class HostSession extends Emitter {
       after,
     };
     this.emit('roll', { ...roll, frames: sim.frames });
-    this.broadcast({ type: 'roll', ...roll, frames: encodeFrames(sim.frames) });
+    this.rev++;
+    this.broadcast({ type: 'roll', rev: this.rev, ...roll, frames: encodeFrames(sim.frames) });
     const lead = init ? 0 : PICKUP_MS;
     this.lockTimer = setTimeout(() => {
       this.busy = false;
@@ -298,12 +362,16 @@ export class HostSession extends Emitter {
     this.guard(() => {
       const used = new Set(this.game.players.map((p) => p.name));
       const name = BOT_NAMES.find((n) => !used.has(n)) || `电脑${this.game.players.length}`;
-      this.game.addPlayer({ id: `bot-${randomCode(6)}`, name, isBot: true });
+      const id = `bot-${randomCode(6)}`;
+      this.keys.set(id, null);
+      this.game.addPlayer({ id, name, isBot: true });
     });
   }
 
   addLocalPlayer(name) {
-    this.guard(() => this.game.addPlayer({ id: `local-${randomCode(6)}`, name: name || `玩家${this.game.players.length + 1}` }));
+    const id = `local-${randomCode(6)}`;
+    this.keys.set(id, null);
+    this.guard(() => this.game.addPlayer({ id, name: name || `玩家${this.game.players.length + 1}` }));
   }
 
   kick(id) {
@@ -314,6 +382,9 @@ export class HostSession extends Emitter {
       this.conns.delete(id);
       setTimeout(() => entry.conn.close(), 300);
     }
+    clearTimeout(this.grace.get(id));
+    this.grace.delete(id);
+    if (this.game.players.some((p) => p.id === id && !p.isBot && !id.startsWith('local-'))) this.kicked.add(id);
     this.guard(() => this.game.removePlayer(id));
   }
 
@@ -333,59 +404,139 @@ export class HostSession extends Emitter {
   }
 }
 
-/** 联机客户端：发送投掷请求，接收状态与轨迹 */
+/**
+ * 联机客户端：发送投掷请求，接收状态与轨迹。
+ * 连接意外中断时自动重连（同一个玩家 id 回到原座位），期间 status = 'reconnecting'
+ */
 export class ClientSession extends Emitter {
-  constructor({ me, code }) {
+  constructor({ me, code, join = joinRoom }) {
     super();
+    this.join = join;
     this.mode = 'client';
     this.isHost = false;
     this.meId = me.id;
     this.me = me;
     this.code = code;
     this.state = null;
-    this.lastMsg = Date.now();
+    this.rev = 0;
+    this.link = null;
+    this.status = 'connecting';
+  }
+
+  /** 'p2p' 直连 | 'relay' 服务器中转 */
+  get linkKind() {
+    return this.link?.kind || null;
   }
 
   async open() {
-    this.peer = await openPeer();
-    const conn = this.peer.connect(PEER_PREFIX + this.code, { reliable: true, serialization: 'json' });
-    this.conn = conn;
-    await new Promise((resolve, reject) => {
-      const timer = setTimeout(() => reject({ type: 'timeout' }), 15000);
-      conn.on('open', () => {
-        clearTimeout(timer);
-        resolve();
-      });
-      this.peer.on('error', (e) => {
-        clearTimeout(timer);
-        reject(e);
-      });
-    });
+    await this.connect();
+    this.lastTick = Date.now();
+    this.timer = setInterval(() => this.tick(), PING_MS);
+    this.offVisible = onVisible(() => this.tick());
+    // 不在 pagehide 时通知离开：刷新、前进后退也会触发它，而刷新后同一身份会马上回来。
+    // 关页面按意外断线处理（保留座位 30 秒）；只有点"离开"才立即下线（见 close）
+  }
+
+  async connect() {
+    const link = await this.join(this.code);
+    if (this.closed) return link.close();
+    this.link = link;
+    this.lastMsg = Date.now();
     const welcome = new Promise((resolve, reject) => {
       this.welcomeWait = { resolve, reject };
       setTimeout(() => reject({ type: 'timeout' }), 10000);
     });
-    conn.on('data', (msg) => this.onMsg(msg));
-    conn.on('close', () => this.lost('与房主的连接已断开'));
-    conn.send({ type: 'hello', id: this.me.id, name: this.me.name });
-    await welcome;
-    this.ping = setInterval(() => {
-      if (conn.open) conn.send({ type: 'ping' });
-      if (Date.now() - this.lastMsg > 20000) this.lost('房主长时间无响应');
-    }, 4000);
+    link.on('data', (msg) => link === this.link && this.onMsg(msg));
+    link.on('close', () => link === this.link && this.dropped());
+    link.on('kind', () => link === this.link && this.emit('net', this.status));
+    link.on('resume', () => {
+      if (link !== this.link) return;
+      this.setStatus('online');
+      this.lastSync = 0;
+      link.send({ type: 'sync' });
+    });
+    // 中转是可丢的（QoS 0）：没等到欢迎就一直重发入座请求，房主对重复的入座会再回一次欢迎
+    const hello = () => link.send({ type: 'hello', id: this.me.id, name: this.me.name, key: this.me.key });
+    hello();
+    const retry = setInterval(hello, HELLO_RETRY_MS);
+    try {
+      await welcome;
+    } catch (e) {
+      this.link = null;
+      link.close();
+      throw e;
+    } finally {
+      clearInterval(retry);
+      this.welcomeWait = null;
+    }
+    this.setStatus('online');
+  }
+
+  setStatus(s) {
+    if (this.status === s) return;
+    this.status = s;
+    this.emit('net', s);
+  }
+
+  /** 连接断了：留在牌桌上，后台自动重连 */
+  dropped() {
+    if (this.closed || this.rejoining) return;
+    this.rejoining = true;
+    const old = this.link;
+    this.link = null;
+    old?.close(false);
+    this.setStatus('reconnecting');
+    this.reconnectLoop().finally(() => (this.rejoining = false));
+  }
+
+  async reconnectLoop() {
+    const deadline = Date.now() + RECONNECT_MS;
+    let wait = 500;
+    let last = null;
+    while (!this.closed && Date.now() < deadline) {
+      try {
+        await this.connect();
+        return;
+      } catch (e) {
+        last = e;
+        if (e?.type === 'full' || e?.type === 'denied' || e?.type === 'kicked') break;
+      }
+      await new Promise((r) => setTimeout(r, wait));
+      wait = Math.min(4000, wait * 2);
+    }
+    if (this.closed) return;
+    this.lost(last?.type === 'no-room' || last?.type === 'timeout' ? '房主已离开，房间解散了' : friendlyError(last));
+  }
+
+  tick() {
+    const now = Date.now();
+    // 自己刚从锁屏/后台醒来：先探一下，别急着判定房主掉线
+    if (now - (this.lastTick ?? now) > SUSPEND_MS) this.lastMsg = Math.max(this.lastMsg, now - SILENT_MS + 6000);
+    this.lastTick = now;
+    const link = this.link;
+    if (this.rejoining || !link) return;
+    if (now - this.lastMsg > SILENT_MS) return this.dropped();
+    // 中转的服务器连接断了（它会自己重连）：先提示并暂停投掷
+    this.setStatus(link.kind === 'relay' && !link.broker.online ? 'reconnecting' : 'online');
+    link.send({ type: 'ping', rev: this.rev });
   }
 
   lost(text) {
     if (this.closed) return;
-    this.close();
+    this.close(false);
     this.emit('error', text);
   }
 
-  close() {
+  close(notify = true) {
+    if (this.closed) return;
     this.closed = true;
-    clearInterval(this.ping);
-    this.conn?.close();
-    this.peer?.destroy();
+    clearInterval(this.timer);
+    this.offVisible?.();
+    if (notify && this.link?.open) this.link.send({ type: 'leave' });
+    const link = this.link;
+    this.link = null;
+    // 给"离开"消息一点时间送出
+    if (link) setTimeout(() => link.close(), notify ? 200 : 0);
   }
 
   onMsg(msg) {
@@ -394,44 +545,71 @@ export class ClientSession extends Emitter {
     switch (msg.type) {
       case 'welcome':
         this.state = msg.state;
+        this.rev = msg.rev | 0;
         this.welcomeWait?.resolve();
         this.emit('state', msg.state);
         break;
       case 'state':
         this.state = msg.state;
+        this.rev = msg.rev | 0;
         this.emit('state', msg.state);
         break;
       case 'roll':
         this.state = msg.after;
+        this.rev = msg.rev | 0;
         this.emit('roll', { ...msg, frames: decodeFrames(msg.frames) });
         break;
       case 'hold':
+        if (msg.from === this.meId) break;
         try {
           const frame = decodeFrames(msg.f);
           if (frame.length === STRIDE) this.emit('hold', { frame, sounds: sanitizeSounds(msg.s) });
         } catch {}
         break;
+      case 'ping':
+        this.link?.send({ type: 'pong' });
+        this.checkRev(msg.rev);
+        break;
+      case 'pong':
+        this.checkRev(msg.rev);
+        break;
       case 'full':
         this.welcomeWait?.reject({ type: 'full' });
         break;
+      case 'denied':
+        this.welcomeWait?.reject({ type: 'denied' });
+        break;
       case 'kicked':
-        this.lost('你已被房主移出房间');
+        if (this.welcomeWait) this.welcomeWait.reject({ type: 'kicked' });
+        else this.lost('你已被房主移出房间');
+        break;
+      case 'closed':
+        this.lost('房主解散了房间');
         break;
     }
+  }
+
+  /** 房主的版本号比本地新：说明漏了消息（重连期间），要一份最新状态 */
+  checkRev(rev) {
+    if (!Number.isInteger(rev) || rev <= this.rev || this.status !== 'online') return;
+    const now = Date.now();
+    if (now - (this.lastSync || 0) < 3000) return;
+    this.lastSync = now;
+    this.link?.send({ type: 'sync' });
   }
 
   canThrow() {
     const s = this.state;
     const p = s?.players[s.turn];
-    return s?.phase === 'playing' && p?.id === this.meId;
+    return this.status === 'online' && s?.phase === 'playing' && p?.id === this.meId;
   }
 
   throwDice(payload) {
-    if (this.conn?.open) this.conn.send({ type: 'throw', ...payload });
+    this.link?.send({ type: 'throw', ...payload });
   }
 
   sendHold(h) {
-    if (this.conn?.open) this.conn.send({ type: 'hold', ...h });
+    this.link?.send({ type: 'hold', ...h }, { lossy: true });
   }
 }
 
@@ -443,39 +621,17 @@ function sanitizeSounds(list) {
     .map(([k, s]) => [k, Math.min(1, Math.max(0, s))]);
 }
 
-function openPeer(id) {
-  const Peer = globalThis.Peer;
-  if (!Peer) return Promise.reject({ type: 'no-peerjs' });
-  return new Promise((resolve, reject) => {
-    const peer = id ? new Peer(id, PEER_OPTS) : new Peer(PEER_OPTS);
-    const timer = setTimeout(() => {
-      peer.destroy();
-      reject({ type: 'timeout' });
-    }, 15000);
-    peer.once('open', () => {
-      clearTimeout(timer);
-      resolve(peer);
-    });
-    peer.once('error', (e) => {
-      clearTimeout(timer);
-      peer.destroy();
-      reject(e);
-    });
-  });
-}
-
 export function friendlyError(e) {
   const type = e?.type || '';
   const map = {
-    'peer-unavailable': '房间不存在或房主已离开',
-    'unavailable-id': '房间号被占用，请重试',
-    network: '无法连接信令服务器，请检查网络',
-    'server-error': '信令服务器出错，请稍后再试',
-    'socket-error': '无法连接信令服务器，请检查网络',
-    'browser-incompatible': '当前浏览器不支持 WebRTC',
-    timeout: '连接超时，请检查网络或房间号',
+    'no-room': '找不到这个房间：请核对房间号，或房主已经离开',
+    network: '连不上联机服务器，请检查网络后重试（可以试试关掉 VPN 或换个网络）',
+    timeout: '房主没有响应，请稍后重试',
+    insecure: '当前页面不是安全连接（https），无法联机加密，请用 https 地址打开',
     full: '房间已满（最多 8 人）',
-    'no-peerjs': '联机组件加载失败',
+    denied: '这个身份已在房间里（可能在别的页面打开了），请关闭其他页面后重试',
+    kicked: '你已被房主移出房间',
   };
+
   return map[type] || (typeof e === 'string' ? e : e?.message || '连接失败');
 }

@@ -11,11 +11,11 @@
   <script type="importmap">
     { "imports": { "three": "./vendor/three/three.module.js", "three/addons/": "./vendor/three/addons/" } }
   </script>
-  <script src="vendor/peerjs/peerjs.min.js" defer></script>
   <script type="module" src="js/main.js"></script>
 </head>
 <body>
   <canvas id="stage" aria-label="博饼碗与骰子的三维场景"></canvas>
+  <div id="net-status" class="net-status" role="status" aria-live="polite" hidden><span class="spinner small" aria-hidden="true"></span>连接中断，正在自动重连…</div>
 
   <div id="loading" class="overlay center">
     <div class="loading-box"><div class="spinner" aria-hidden="true"></div><p id="loading-text">正在准备骰子和碗…</p></div>
@@ -33,7 +33,7 @@
       </label>
       <button id="btn-create" class="btn gold">创建联机房间</button>
       <div class="join-row">
-        <input id="in-code" maxlength="5" placeholder="房间号" aria-label="房间号" autocapitalize="characters" spellcheck="false">
+        <input id="in-code" maxlength="12" placeholder="房间号 ABCDE-FGHJK" aria-label="房间号" autocapitalize="characters" spellcheck="false">
         <button id="btn-join" class="btn">加入</button>
       </div>
       <button id="btn-local" class="btn ghost">单机 / 同屏多人</button>
@@ -50,7 +50,8 @@
         <div class="code-label">房间号</div>
         <div id="room-code" class="room-code">-----</div>
         <button id="btn-copy" class="btn small">复制邀请链接</button>
-        <p class="hint">把链接发给朋友，打开即可加入。联机为点对点直连，房主关闭页面则房间解散。</p>
+        <p class="hint">把链接发给朋友，打开即可加入。能直连时点对点直连，否则经公共服务器中转；房主关闭页面则房间解散。</p>
+        <p id="link-kind" class="hint link-kind"></p>
       </div>
       <h3>玩家 <span id="player-count" class="muted"></span></h3>
       <ul id="lobby-players" class="lobby-players"></ul>
@@ -101,7 +102,7 @@
         <button id="btn-throw" class="btn throw" disabled>等待其他玩家</button>
         <button id="btn-motion" class="btn throw ghost" aria-pressed="false" hidden>体感摇骰：关</button>
       </div>
-      <p class="hint key-hint">空格键 = 一键掷骰 · 自由视角下右键拖动旋转</p>
+      <p class="hint key-hint">空格键 = 一键掷骰 · 切到自由视角后可拖动旋转</p>
     </div>
     <div id="toast" class="toast" hidden aria-live="assertive"></div>
     <div id="confetti" class="confetti" aria-hidden="true"></div>

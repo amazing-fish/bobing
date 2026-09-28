@@ -113,10 +113,22 @@ export class HandController {
     return Math.hypot(this.pos.x, this.pos.z) > BOWL.rimR - 1;
   }
 
-  /** 松手：返回交给房主的初始状态（6 × [p,q,v,w]） */
-  release() {
+  /**
+   * 松手：返回交给房主的初始状态（6 × [p,q,v,w]）
+   * toss：额外的水平抛出速度（cm/s）。体感摇骰停下时手几乎静止，用它补一个轻抛，每颗骰子略有差异
+   */
+  release(toss = null) {
     if (this.mode !== 'hold') return null;
     this.pw.release({ x: this.vel.x, y: 0, z: this.vel.z });
+    if (toss) {
+      for (const b of this.pw.dice) {
+        const v = b.linvel();
+        const j = 0.8 + Math.random() * 0.4;
+        b.setLinvel({ x: v.x + toss.x * j + (Math.random() - 0.5) * 12, y: v.y, z: v.z + toss.z * j + (Math.random() - 0.5) * 12 }, true);
+        const w = b.angvel();
+        b.setAngvel({ x: w.x + (Math.random() - 0.5) * 30, y: w.y + (Math.random() - 0.5) * 30, z: w.z + (Math.random() - 0.5) * 30 }, true);
+      }
+    }
     this.mode = 'predict';
     this.acc = 0;
     return this.pw.getState();

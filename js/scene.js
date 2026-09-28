@@ -6,7 +6,7 @@ import { RoundedBoxGeometry } from 'three/addons/geometries/RoundedBoxGeometry.j
 import { bowlProfile, innerRadiusAt, BOWL, DIE, FACE_VALUES, TABLE_HALF, HAND, STRIDE, quatForValue } from './physics.js';
 import { dieFaceTexture, bowlOuterTexture, bowlInnerTexture, bowlBottomTexture, tableTexture } from './textures.js';
 
-const HOLD_DELAY = 120; // 观战时手部数据的渲染延迟，用于插值平滑
+const HOLD_DELAY = 200; // 观战缓冲（毫秒）：经服务器中转时采样只有 10Hz 且有抖动
 
 /** 在帧序列里按帧号插值出一帧（位置线性、旋转球面插值） */
 function sampleFrames(frames, f, out) {
@@ -122,7 +122,9 @@ export class Stage {
     this.fitDist = 45;
     this.cam = { az: Math.PI / 2, polar: 0.9, dist: 45, ty: 3 };
     this.shot = { kind: 'overview' };
-    this.camFrom = null;
+    this.camVel = { az: 0, polar: 0, dist: 0, ty: 0 };
+    this.camSmooth = 0.45;
+    this.driftAz = this.cam.az;
 
     this.anim = null; // 回放中的投掷
     this.live = null; // 本机实时摇骰的当前帧
@@ -286,14 +288,17 @@ export class Stage {
   }
 
   // ---------- 镜头导演 ----------
-  // 所有人看到同样的机位：轮到谁就站到谁的座位后方俯看碗；骰子停稳后切到正上方看点数。
+  // 所有人看到同样的机位：轮到谁就站到谁的座位后方俯看碗；骰子停稳后推近俯看点数。
   // 机位只由对局状态决定，因此各端无需额外同步就能保持一致。"自由视角"下可以自己拖动旋转。
-  /** @param {{kind: 'overview'|'seat'|'result', az?: number}} shot */
-  setShot(shot, ms = 900) {
+  // 运动用带速度的临界阻尼弹簧：中途换目标（投掷→结果→下一位接连发生）也不会顿一下重新起步；
+  // 绕到桌子另一边时镜头顺势抬高拉远，像摇臂一样越过碗的上方，而不是贴着桌面平扫。
+  /** @param {{kind: 'overview'|'seat'|'result', az?: number}} shot  ms：大约多久到位 */
+  setShot(shot, ms = 1200) {
     if (!shot) return;
+    const same = this.shot && this.shot.kind === shot.kind && Math.abs(Math.sin(((this.shot.az ?? 0) - (shot.az ?? 0)) / 2)) < 1e-3;
+    if (shot.kind === 'overview' && this.shot?.kind !== 'overview') this.driftAz = this.cam.az;
     this.shot = shot;
-    if (this.free) return;
-    this.camFrom = { ...this.cam, t0: performance.now(), ms };
+    if (!same) this.camSmooth = ms / 1000 / 2.6;
   }
 
   setFreeCamera(on) {
@@ -307,37 +312,42 @@ export class Stage {
       const dx = p.x, dz = p.z, dy = p.y - this.controls.target.y;
       const dist = Math.hypot(dx, dy, dz);
       this.cam = { az: Math.atan2(dz, dx), polar: Math.acos(Math.max(-1, Math.min(1, dy / dist))), dist, ty: this.controls.target.y };
-      this.setShot(this.shot);
+      this.camVel = { az: 0, polar: 0, dist: 0, ty: 0 };
+      this.driftAz = this.cam.az;
+      this.camSmooth = 0.45;
     }
   }
 
   /** 机位参数（相对碗心的球坐标） */
-  shotParams(shot, now) {
+  shotParams(shot) {
     const d = this.fitDist;
-    if (shot.kind === 'overview') return { az: this.cam.az + 0.00012 * (now - (this.lastCamT ?? now)), polar: 0.9, dist: d * 1.05, ty: 3 };
-    if (shot.kind === 'result') return { az: shot.az ?? this.cam.az, polar: 0.32, dist: d * 0.72, ty: 1.5 };
+    if (shot.kind === 'overview') return { az: this.driftAz, polar: 0.9, dist: d * 1.05, ty: 3 };
+    if (shot.kind === 'result') return { az: shot.az ?? this.cam.az, polar: 0.36, dist: d * 0.74, ty: 1.5 };
     return { az: shot.az, polar: 0.78, dist: d, ty: 3 };
   }
 
   updateCamera(now) {
+    const dt = Math.min(0.05, (now - (this.lastCamT ?? now)) / 1000);
+    this.lastCamT = now;
     if (this.free) {
       this.controls.update();
       return;
     }
-    const goal = this.shotParams(this.shot, now);
-    const f = this.camFrom;
-    let c = goal;
-    if (f && this.shot.kind !== 'overview') {
-      const k = Math.min(1, (now - f.t0) / f.ms);
-      const e = k < 0.5 ? 4 * k * k * k : 1 - (-2 * k + 2) ** 3 / 2;
-      // 方位角走最短的一边
-      let daz = goal.az - f.az;
-      daz = Math.atan2(Math.sin(daz), Math.cos(daz));
-      c = { az: f.az + daz * e, polar: f.polar + (goal.polar - f.polar) * e, dist: f.dist + (goal.dist - f.dist) * e, ty: f.ty + (goal.ty - f.ty) * e };
-      if (k >= 1) this.camFrom = null;
-    }
-    this.cam = c;
-    this.lastCamT = now;
+    if (this.shot.kind === 'overview') this.driftAz += 0.12 * dt;
+    const goal = this.shotParams(this.shot);
+    const c = this.cam;
+    const v = this.camVel;
+    const T = this.camSmooth;
+    // 方位角走最短的一边
+    const daz = Math.atan2(Math.sin(goal.az - c.az), Math.cos(goal.az - c.az));
+    // 剩余转角越大，镜头抬得越高、拉得越远（转到位时自然落回）
+    const swing = Math.min(1, Math.abs(daz) / Math.PI);
+    const lift = Math.sin(swing * Math.PI * 0.5);
+    // 大角度转场放慢（π 的转角峰值约 3 rad/s）
+    c.az = smoothDamp(c.az, c.az + daz, v, 'az', T * (1 + 0.7 * swing), dt);
+    c.polar = smoothDamp(c.polar, Math.max(0.15, goal.polar - 0.28 * lift), v, 'polar', T, dt);
+    c.dist = smoothDamp(c.dist, goal.dist * (1 + 0.12 * lift), v, 'dist', T, dt);
+    c.ty = smoothDamp(c.ty, goal.ty, v, 'ty', T, dt);
     const s = Math.sin(c.polar);
     this.camera.position.set(Math.cos(c.az) * s * c.dist, c.ty + Math.cos(c.polar) * c.dist, Math.sin(c.az) * s * c.dist);
     this.camera.lookAt(0, c.ty, 0);
@@ -531,4 +541,24 @@ export class Stage {
     this.updateCamera(now);
     this.renderer.render(this.scene, this.camera);
   }
+}
+
+/** 临界阻尼平滑（同 Unity SmoothDamp）：保留速度，中途换目标不会突然停顿；maxSpeed 限制最快速度 */
+function smoothDamp(cur, target, vel, key, T, dt, maxSpeed = Infinity) {
+  if (dt <= 0) return cur;
+  T = Math.max(1e-4, T);
+  const omega = 2 / T;
+  const x = omega * dt;
+  const exp = 1 / (1 + x + 0.48 * x * x + 0.235 * x * x * x);
+  const maxChange = maxSpeed * T;
+  const change = Math.max(-maxChange, Math.min(maxChange, cur - target));
+  const to = cur - change;
+  const temp = (vel[key] + omega * change) * dt;
+  vel[key] = (vel[key] - omega * temp) * exp;
+  let out = to + (change + temp) * exp;
+  if (target - cur > 0 === out > target) {
+    out = target;
+    vel[key] = 0;
+  }
+  return out;
 }
