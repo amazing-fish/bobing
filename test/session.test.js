@@ -216,3 +216,23 @@ test('客人：入座请求丢了会重发，直到收到欢迎', async () => {
   assert.equal(link.sent[0].key, KA, '入座请求带着本人密钥');
   c.close(false);
 });
+
+test('被踢的身份：用同一 id 和密钥重连也回不来（"已被移出"的通知丢了也一样）', async () => {
+  const { host, a } = setup();
+  host.kick('a');
+  const again = fakeConn();
+  host.onConn(again);
+  again.recv({ type: 'hello', id: 'a', name: 'A', key: KA });
+  assert.equal(again.of('kicked').length, 1);
+  assert.equal(again.of('welcome').length, 0);
+  assert.ok(!host.game.players.find((p) => p.id === 'a')?.online);
+  // 客人侧：入座时被告知已被移出，直接结束，不再重连
+  const link = new Emitter();
+  link.open = true;
+  link.kind = 'relay';
+  link.close = () => (link.open = false);
+  link.send = (m) => m.type === 'hello' && setTimeout(() => link.emit('data', { type: 'kicked' }));
+  const c = new ClientSession({ me: { id: 'a', name: 'A', key: KA }, code: 'ABCDEFGHJK', join: async () => link });
+  await assert.rejects(c.open(), { type: 'kicked' });
+  host.close();
+});

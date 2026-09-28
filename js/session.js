@@ -73,6 +73,7 @@ export class HostSession extends Emitter {
     // 玩家 id 是公开的（在对局状态里），所以每个 id 绑定一把只有本人知道的密钥：
     // 客人第一次入座时绑定，之后凭同一把密钥才能以这个身份重连；房主、电脑、同屏玩家的 id 不接受外来入座
     this.keys = new Map();
+    this.kicked = new Set(); // 被房主移出的玩家 id：本房间内不再接受（"已被移出"的通知可能丢了，客人会自动重连）
     this.keys.set(me.id, null);
     this.hub = null;
     this.status = 'online';
@@ -129,6 +130,11 @@ export class HostSession extends Emitter {
       const name = String(msg.name || '玩家').slice(0, 12);
       const key = typeof msg.key === 'string' ? msg.key.slice(0, 128) : '';
       if (!id) return;
+      if (this.kicked.has(id)) {
+        conn.send({ type: 'kicked' });
+        setTimeout(() => conn.close(), 300);
+        return;
+      }
       // 冒用别人的 id（id 在对局状态里人人可见）：拒绝
       if (key.length < 16 || (this.keys.has(id) && this.keys.get(id) !== key)) {
         conn.send({ type: 'denied' });
@@ -378,7 +384,7 @@ export class HostSession extends Emitter {
     }
     clearTimeout(this.grace.get(id));
     this.grace.delete(id);
-    this.keys.delete(id);
+    if (this.game.players.some((p) => p.id === id && !p.isBot && !id.startsWith('local-'))) this.kicked.add(id);
     this.guard(() => this.game.removePlayer(id));
   }
 
@@ -427,11 +433,8 @@ export class ClientSession extends Emitter {
     this.lastTick = Date.now();
     this.timer = setInterval(() => this.tick(), PING_MS);
     this.offVisible = onVisible(() => this.tick());
-    if (typeof addEventListener === 'function') {
-      // 关页面时告诉房主"我走了"，不必等超时
-      this.onHide = () => this.link?.open && this.link.send({ type: 'leave' });
-      addEventListener('pagehide', this.onHide);
-    }
+    // 不在 pagehide 时通知离开：刷新、前进后退也会触发它，而刷新后同一身份会马上回来。
+    // 关页面按意外断线处理（保留座位 30 秒）；只有点"离开"才立即下线（见 close）
   }
 
   async connect() {
@@ -496,7 +499,7 @@ export class ClientSession extends Emitter {
         return;
       } catch (e) {
         last = e;
-        if (e?.type === 'full' || e?.type === 'denied') break;
+        if (e?.type === 'full' || e?.type === 'denied' || e?.type === 'kicked') break;
       }
       await new Promise((r) => setTimeout(r, wait));
       wait = Math.min(4000, wait * 2);
@@ -529,7 +532,6 @@ export class ClientSession extends Emitter {
     this.closed = true;
     clearInterval(this.timer);
     this.offVisible?.();
-    if (this.onHide) removeEventListener('pagehide', this.onHide);
     if (notify && this.link?.open) this.link.send({ type: 'leave' });
     const link = this.link;
     this.link = null;
@@ -578,7 +580,8 @@ export class ClientSession extends Emitter {
         this.welcomeWait?.reject({ type: 'denied' });
         break;
       case 'kicked':
-        this.lost('你已被房主移出房间');
+        if (this.welcomeWait) this.welcomeWait.reject({ type: 'kicked' });
+        else this.lost('你已被房主移出房间');
         break;
       case 'closed':
         this.lost('房主解散了房间');
@@ -627,6 +630,7 @@ export function friendlyError(e) {
     insecure: '当前页面不是安全连接（https），无法联机加密，请用 https 地址打开',
     full: '房间已满（最多 8 人）',
     denied: '这个身份已在房间里（可能在别的页面打开了），请关闭其他页面后重试',
+    kicked: '你已被房主移出房间',
   };
 
   return map[type] || (typeof e === 'string' ? e : e?.message || '连接失败');
