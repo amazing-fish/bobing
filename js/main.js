@@ -2,7 +2,7 @@
 import { initPhysics, encodeFrames, HAND, PICKUP_MS } from './physics.js';
 import { PRIZES, PRIZE_BY_ID, ZY_LEVELS, totalCakes } from './rules.js';
 import { defaultPool } from './game.js';
-import { HostSession, ClientSession, friendlyError, randomId } from './session.js';
+import { HostSession, ClientSession, friendlyError, randomId, normalizeCode, formatCode } from './session.js';
 import { HandController } from './hand.js';
 import { unlockAudio, playImpact, playShake, playChime, playFail, setMuted, isMuted } from './audio.js';
 
@@ -56,9 +56,10 @@ async function boot() {
   setupGame();
   setupDialogs();
   showScreen('home');
-  const code = new URLSearchParams(location.search).get('room');
+  // 邀请链接把房间号放在 # 后面（不会发给任何服务器）；也兼容旧的 ?room=
+  const code = normalizeCode(new URLSearchParams(location.hash.slice(1)).get('room') || new URLSearchParams(location.search).get('room'));
   if (code) {
-    $('in-code').value = code.toUpperCase().slice(0, 5);
+    $('in-code').value = formatCode(code);
     setMsg('home-msg', '已填好房间号，输入昵称后点“加入”', true);
   }
 }
@@ -110,9 +111,9 @@ async function startSession(kind) {
     return;
   }
   store.set('bobing.name', me.name);
-  const code = $('in-code').value.trim().toUpperCase();
-  if (kind === 'client' && !/^[A-Z0-9]{5}$/.test(code)) {
-    setMsg('home-msg', '请输入 5 位房间号');
+  const code = normalizeCode($('in-code').value);
+  if (kind === 'client' && !code) {
+    setMsg('home-msg', '请输入 10 位房间号（如 ABCDE-FGHJK）');
     $('in-code').focus();
     return;
   }
@@ -124,7 +125,7 @@ async function startSession(kind) {
     await s.open();
     session = s;
     keepAwake(true);
-    if (s.code) history.replaceState(null, '', `?room=${s.code}`);
+    if (s.code) history.replaceState(null, '', `${location.pathname}#room=${s.code}`);
     setMsg('home-msg', '');
     renderNet();
     render(s.state ? structuredClone(s.state) : view);
@@ -323,7 +324,7 @@ function renderLobby(st) {
   const local = session?.mode === 'local';
   $('lobby-title').textContent = local ? '单机 / 同屏多人' : host ? '你的房间' : '已加入房间';
   $('share-box').hidden = local;
-  $('room-code').textContent = session?.code || st.code || '-----';
+  $('room-code').textContent = formatCode(session?.code || st.code) || '-----';
   $('player-count').textContent = `${st.players.length} / 8`;
   $('lobby-players').innerHTML = st.players
     .map(
@@ -352,7 +353,7 @@ function renderLobby(st) {
 }
 
 async function copyInvite() {
-  const url = `${location.origin}${location.pathname}?room=${session?.code}`;
+  const url = `${location.origin}${location.pathname}#room=${session?.code}`;
   try {
     await navigator.clipboard.writeText(url);
     setMsg('lobby-msg', '邀请链接已复制', true);

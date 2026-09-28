@@ -8,6 +8,8 @@ import { Emitter, HostHub, joinRoom } from './net.js';
 const SEATS = 8;
 const REVEAL_MS = 2200; // 骰子停稳后展示结果的时间
 const CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+// 房间号同时是加密密钥的来源（见 net.js），所以要足够长：10 位 ≈ 50 bit
+export const CODE_LEN = 10;
 const PING_MS = 3000;
 const SILENT_MS = 20000; // 这么久收不到对方任何消息，认为连接已断
 const SUSPEND_MS = 8000; // 本机计时器停摆这么久（锁屏、切后台），说明是自己睡着了，不怪对方
@@ -21,6 +23,17 @@ export function randomCode(n = 5) {
   crypto.getRandomValues(buf);
   for (const v of buf) s += CODE_CHARS[v % CODE_CHARS.length];
   return s;
+}
+
+/** 用户输入/链接里的房间号 → 规范形式（去掉分隔符、转大写）；不合法返回 null */
+export function normalizeCode(s) {
+  const c = String(s || '').toUpperCase().replace(/[\s-]/g, '');
+  return c.length === CODE_LEN && [...c].every((ch) => CODE_CHARS.includes(ch)) ? c : null;
+}
+
+/** 展示用：ABCDE-FGHJK */
+export function formatCode(c) {
+  return c ? `${c.slice(0, 5)}-${c.slice(5)}` : '';
 }
 
 export function randomId() {
@@ -70,7 +83,7 @@ export class HostSession extends Emitter {
       this.emit('state', this.game.snapshot());
       return;
     }
-    this.code = randomCode();
+    this.code = randomCode(CODE_LEN);
     this.hub = new HostHub(this.code, (link) => this.onConn(link));
     await this.hub.start();
     this.game.state.code = this.code;
@@ -586,6 +599,7 @@ export function friendlyError(e) {
     'no-room': '找不到这个房间：请核对房间号，或房主已经离开',
     network: '连不上联机服务器，请检查网络后重试（可以试试关掉 VPN 或换个网络）',
     timeout: '房主没有响应，请稍后重试',
+    insecure: '当前页面不是安全连接（https），无法联机加密，请用 https 地址打开',
     full: '房间已满（最多 8 人）',
   };
 

@@ -99,7 +99,7 @@ input {
   background: #fff; border: 1.5px solid #e2c89a; border-radius: 10px; outline: none;
 }
 input:focus-visible { border-color: var(--red); box-shadow: 0 0 0 3px rgba(184, 29, 29, 0.18); }
-#in-code { text-transform: uppercase; letter-spacing: 4px; font-weight: 700; }
+#in-code { text-transform: uppercase; letter-spacing: 1px; font-weight: 700; min-width: 0; }
 .join-row { display: flex; gap: 8px; margin: 10px 0; }
 .join-row input { flex: 1; min-width: 0; }
 .row { display: flex; gap: 10px; margin-top: 16px; }
@@ -129,7 +129,7 @@ input:focus-visible { border-color: var(--red); box-shadow: 0 0 0 3px rgba(184, 
 /* ---------- 大厅 ---------- */
 .share-box { text-align: center; padding: 12px; background: #fff; border: 1.5px dashed var(--gold); border-radius: 12px; }
 .code-label { font-size: 12px; color: var(--muted); }
-.room-code { font-size: 38px; font-weight: 800; letter-spacing: 8px; color: var(--red); margin: 2px 0 8px; font-variant-numeric: tabular-nums; }
+.room-code { font-size: clamp(24px, 7.5vw, 34px); font-weight: 800; letter-spacing: 3px; color: var(--red); margin: 2px 0 8px; white-space: nowrap; font-variant-numeric: tabular-nums; }
 .lobby-players { list-style: none; margin: 0; padding: 0; display: grid; gap: 6px; }
 .lobby-players li { display: flex; align-items: center; gap: 8px; padding: 8px 10px; background: #fff; border-radius: 10px; border: 1px solid #f0dfbf; }
 .lobby-players .name { flex: 1; font-weight: 600; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

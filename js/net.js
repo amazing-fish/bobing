@@ -2,8 +2,9 @@
 // 1) 找房间、交换 WebRTC 信令、兜底转发，都走公共 MQTT 服务器（WebSocket over TLS，和普通 HTTPS 一样容易连通）；
 // 2) 连上后尝试升级为 WebRTC 直连（DataChannel），直连失败（对称 NAT、VPN 屏蔽 UDP 等）就一直走服务器中转。
 // 房主同时挂在多台服务器上，客人向所有服务器"敲门"，谁先应答用谁，所以只要双方能共同连上任意一台即可。
+// 公共服务器上传的全是用房间号派生的密钥加密的密文，见下方"房间密钥"。
 export const BROKERS = ['wss://broker-cn.emqx.io:8084/mqtt', 'wss://broker.emqx.io:8084/mqtt', 'wss://broker.hivemq.com:8884/mqtt'];
-const NS = 'bobing-cn/v2';
+const NS = 'bobing-cn/v3';
 export const ICE_SERVERS = [
   { urls: 'stun:stun.miwifi.com:3478' },
   { urls: 'stun:stun.chat.bilibili.com:3478' },
@@ -126,6 +127,82 @@ export class MqttParser {
   }
 }
 
+// ---------- 房间密钥：公共服务器上的一切内容都加密并认证 ----------
+// 公共服务器谁都能订阅，所以房间号本身绝不出现在服务器上：由房间号（10 位，约 50 bit）经 PBKDF2 慢哈希
+// 派生出主题名和 AES-GCM 密钥。旁观者看到的只是随机主题下的密文，无法读取、伪造或篡改；
+// 想猜房间号只能逐个做 20 万次哈希，在房间的存活时间内不现实。重放由每条连接的随机 id 与递增计数挡住。
+const KDF_ITER = 200000;
+const KDF_SALT = 'bobing-cn/v3/room';
+const rooms = new Map(); // code -> Promise<Room>
+
+function b64(bytes) {
+  let s = '';
+  for (let i = 0; i < bytes.length; i += 0x8000) s += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+  return btoa(s);
+}
+
+function unb64(s) {
+  const bin = atob(s);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
+/** 由房间号派生 { id: 主题名, seal(topic, obj), open(topic, str) }；同一房间号只算一次 */
+export function deriveRoom(code) {
+  let p = rooms.get(code);
+  if (!p) {
+    p = makeRoom(code);
+    rooms.set(code, p);
+    p.catch(() => rooms.delete(code));
+  }
+  return p;
+}
+
+async function makeRoom(code) {
+  const subtle = globalThis.crypto?.subtle;
+  if (!subtle) throw { type: 'insecure' };
+  const base = await subtle.importKey('raw', enc.encode(code), 'PBKDF2', false, ['deriveBits']);
+  const master = await subtle.deriveBits({ name: 'PBKDF2', hash: 'SHA-256', salt: enc.encode(KDF_SALT), iterations: KDF_ITER }, base, 256);
+  const hk = await subtle.importKey('raw', master, 'HKDF', false, ['deriveBits', 'deriveKey']);
+  const info = (s) => ({ name: 'HKDF', hash: 'SHA-256', salt: new Uint8Array(0), info: enc.encode(s) });
+  const idBits = new Uint8Array(await subtle.deriveBits(info('topic'), hk, 128));
+  const key = await subtle.deriveKey(info('aead'), hk, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
+  const id = [...idBits].map((b) => b.toString(16).padStart(2, '0')).join('');
+  return {
+    id,
+    /** 加密并绑定主题（附加数据），密文换到别的主题上也解不开 */
+    async seal(topic, obj) {
+      const iv = crypto.getRandomValues(new Uint8Array(12));
+      const ct = new Uint8Array(await subtle.encrypt({ name: 'AES-GCM', iv, additionalData: enc.encode(topic) }, key, enc.encode(JSON.stringify(obj))));
+      const out = new Uint8Array(12 + ct.length);
+      out.set(iv);
+      out.set(ct, 12);
+      return b64(out);
+    },
+    /** 解密；密钥不对、被篡改、格式不对都返回 null */
+    async open(topic, str) {
+      try {
+        const bytes = unb64(str);
+        if (bytes.length < 29) return null;
+        const pt = await subtle.decrypt({ name: 'AES-GCM', iv: bytes.subarray(0, 12), additionalData: enc.encode(topic) }, key, bytes.subarray(12));
+        const msg = JSON.parse(dec.decode(pt));
+        return msg && typeof msg === 'object' ? msg : null;
+      } catch {
+        return null;
+      }
+    },
+  };
+}
+
+/** 订阅回调：逐条解密后按到达顺序处理（解密是异步的，不串行会乱序） */
+function sealedHandler(room, topic, fn) {
+  let chain = Promise.resolve();
+  return (payload, broker) => {
+    chain = chain.then(() => room.open(topic, payload)).then((msg) => msg && fn(msg, broker), () => {});
+  };
+}
+
 const liveBrokers = new Set();
 if (typeof document !== 'undefined') {
   // 手机解锁/切回页面、网络恢复时，立刻检查连接是否还活着（后台期间 socket 可能已经悄悄断了）
@@ -200,15 +277,7 @@ export class Broker {
       this.kaTimer = setInterval(() => this.keepalive(), 5000);
       this.onOnline?.(this);
     } else if (pk.type === 3) {
-      const fn = this.subs.get(pk.topic);
-      if (!fn) return;
-      let msg;
-      try {
-        msg = JSON.parse(pk.payload);
-      } catch {
-        return;
-      }
-      if (msg && typeof msg === 'object') fn(msg, this);
+      this.subs.get(pk.topic)?.(pk.payload, this);
     }
   }
 
@@ -252,10 +321,16 @@ export class Broker {
   }
 
   /** lossy：离线时直接丢弃（摇骰画面、敲门这类会重复发送的消息） */
-  publish(topic, obj, lossy = false) {
-    const payload = JSON.stringify(obj);
+  publish(topic, payload, lossy = false) {
     if (this.online && this.raw(mqtt.publish(topic, payload))) return;
     if (!lossy && this.queue.length < 200) this.queue.push([topic, payload]);
+  }
+
+  /** 加密后发布；加密是异步的，串成一条链保证按调用顺序发出 */
+  publishSealed(room, topic, obj, lossy = false) {
+    this.sealing = (this.sealing || Promise.resolve())
+      .then(() => room.seal(topic, obj))
+      .then((payload) => !this.closedWs && this.publish(topic, payload, lossy), () => {});
   }
 
   drop(reconnect) {
@@ -285,30 +360,37 @@ export class Broker {
     liveBrokers.delete(this);
     clearTimeout(this.retryTimer);
     clearInterval(this.kaTimer);
-    const ws = this.ws;
-    if (ws && this.online) {
-      this.raw(mqtt.disconnect());
-      // 稍等片刻再关，让刚发出的"房间解散/离开"之类的消息送达
-      setTimeout(() => this.drop(false), 300);
-    } else this.drop(false);
+    // 先等排队加密的消息（"房间解散/离开"之类）发出去，再断开
+    (this.sealing || Promise.resolve()).then(() => {
+      this.closedWs = true;
+      if (this.ws && this.online) {
+        this.raw(mqtt.disconnect());
+        setTimeout(() => this.drop(false), 300);
+      } else this.drop(false);
+    });
   }
 }
 
 /**
  * 房主与一位客人之间的连接。先走服务器中转，协商成功后自动换成 WebRTC 直连。
- * 事件：data(msg) / close() / kind('relay'|'p2p')
+ * 事件：data(msg) / close() / kind('relay'|'p2p') / resume()
  * 有序消息带序号，接收端按序交付（切换通道的瞬间两条路可能乱序）；lossy 消息不排队、可丢。
+ * 中转封包都加密，并带 c（客人连接 id）、h（房主为这条连接生成的随机 id）、n（发送方递增计数）：
+ * 不是这条连接的、计数没有变大的（重放）一律丢弃。直连通道本身有 DTLS 加密，不再重复加密。
  */
 export class Link extends Emitter {
-  constructor({ role, code, cid, broker }) {
+  constructor({ role, room, cid, h, broker }) {
     super();
     this.role = role;
-    this.code = code;
+    this.room = room;
     this.cid = cid;
+    this.h = h;
     this.broker = broker;
     this.kind = 'relay';
     this.open = true;
-    this.outSeq = 0;
+    this.outN = 0; // 中转封包计数（防重放）
+    this.inN = 0;
+    this.outSeq = 0; // 有序消息序号
     this.inSeq = 0;
     this.pending = new Map();
     this.lastLossy = 0;
@@ -316,7 +398,7 @@ export class Link extends Emitter {
     this.dc = null;
     this.upgradeFailed = false;
     this.cands = [];
-    this.topic = role === 'host' ? `${NS}/${code}/c/${cid}` : `${NS}/${code}/h`;
+    this.topic = role === 'host' ? `${NS}/${room.id}/c/${cid}` : `${NS}/${room.id}/h`;
   }
 
   send(msg, { lossy = false } = {}) {
@@ -337,11 +419,21 @@ export class Link extends Emitter {
     this.relay(env, lossy);
   }
 
-  relay(env, lossy = false) {
-    this.broker.publish(this.topic, { ...env, c: this.cid }, lossy);
+  /** 经服务器发给对方：补上连接标识与计数后加密 */
+  relay(env, lossy = false, broker = this.broker) {
+    broker.publishSealed(this.room, this.topic, { ...env, c: this.cid, h: this.h, n: ++this.outN }, lossy);
   }
 
-  /** 收到对方的封包（来自服务器或直连通道） */
+  /** 服务器转来的封包（已解密）：校验属于这条连接且不是重放 */
+  accept(env) {
+    if (!this.open || env.c !== this.cid || env.h !== this.h) return false;
+    if (!Number.isSafeInteger(env.n) || env.n <= this.inN) return false;
+    this.inN = env.n;
+    this.recv(env);
+    return true;
+  }
+
+  /** 收到对方的封包（直连通道的，或 accept 校验过的） */
   recv(env) {
     if (!this.open || !env) return;
     if (env.k === 'd') this.recvData(env);
@@ -477,22 +569,30 @@ export class Link extends Emitter {
   }
 }
 
-/** 房主：在所有服务器上监听房间，每位客人（每次连接）得到一个 Link */
+/**
+ * 房主：在所有服务器上监听房间，每位客人（每次连接）得到一个 Link。
+ * 客人发来第一条正式消息之前，连接不固定在某台服务器：敲门从哪台来，就在哪台应答
+ * （客人可能在收到应答前断开了那台，换另一台继续敲）；第一条消息从哪台来，就固定用哪台。
+ */
 export class HostHub {
   constructor(code, onLink, urls = BROKERS) {
     this.code = code;
     this.onLink = onLink;
     this.links = new Map(); // cid -> Link
+    this.dead = new Set(); // 已关闭的连接 id：重放的旧敲门不会再建连接
+    this.hid = token(12); // 本房间广播用的 id
+    this.bn = 0; // 广播计数
     this.brokers = urls.map((u) => new Broker(u));
   }
 
   /** 至少一台服务器连上即可开房；其余的在后台继续重试 */
-  start(timeoutMs = 12000) {
-    const topic = `${NS}/${this.code}/h`;
+  async start(timeoutMs = 12000) {
+    this.room = await deriveRoom(this.code);
+    const topic = `${NS}/${this.room.id}/h`;
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => reject({ type: 'network' }), timeoutMs);
       for (const b of this.brokers) {
-        b.subscribe(topic, (env, br) => this.onEnvelope(env, br));
+        b.subscribe(topic, sealedHandler(this.room, topic, (env, br) => this.onEnvelope(env, br)));
         let first = true;
         b.onOnline = () => {
           if (first) {
@@ -500,7 +600,7 @@ export class HostHub {
             clearTimeout(timer);
             return resolve();
           }
-          for (const link of this.links.values()) if (link.broker === b) link.resume();
+          for (const link of this.links.values()) if (link.pinned && link.broker === b) link.resume();
         };
         b.start();
       }
@@ -509,21 +609,43 @@ export class HostHub {
 
   onEnvelope(env, broker) {
     const cid = typeof env.c === 'string' ? env.c.slice(0, 32) : '';
-    if (!cid) return;
+    if (!cid || this.dead.has(cid)) return;
     let link = this.links.get(cid);
     if (env.k === 'knock') {
+      if (typeof env.cn !== 'string') return;
       if (!link) {
         if (this.links.size >= MAX_LINKS) return;
-        link = new Link({ role: 'host', code: this.code, cid, broker });
+        link = new Link({ role: 'host', room: this.room, cid, h: token(12), broker });
+        link.hid = this.hid;
         this.links.set(cid, link);
-        link.on('close', () => this.links.get(cid) === link && this.links.delete(cid));
+        link.on('close', () => {
+          clearTimeout(link.idleTimer);
+          if (this.links.get(cid) === link) this.links.delete(cid);
+          this.dead.add(cid);
+          if (this.dead.size > 500) this.dead.delete(this.dead.values().next().value);
+        });
+        // 敲了门却一直不来正式消息（客人放弃了，或是重放）：到时清掉
+        link.idleTimer = setTimeout(() => !link.pinned && link.close(false), 20000);
         this.onLink(link);
       }
-      // 应答可能丢了，客人会重复敲门：每次都回
-      if (link.broker === broker) link.relay({ k: 'ack' });
+      if (link.pinned && link.broker !== broker) return;
+      // 应答可能丢了，客人会重复敲门：每次都回；cn 是客人这次的随机数，证明应答是新的
+      link.relay({ k: 'ack', cn: env.cn, u: this.hid }, true, broker);
       return;
     }
-    if (link && link.broker === broker) link.recv(env);
+    if (!link || (link.pinned && link.broker !== broker)) return;
+    if (!link.pinned) {
+      const prev = link.broker;
+      link.broker = broker;
+      if (!link.accept(env)) {
+        link.broker = prev;
+        return;
+      }
+      link.pinned = true;
+      clearTimeout(link.idleTimer);
+      return;
+    }
+    link.accept(env);
   }
 
   /** 摇骰画面这类高频消息：直连的逐个发，中转的每台服务器只发一次（客人订阅同一个广播主题） */
@@ -531,13 +653,14 @@ export class HostHub {
     const now = Date.now();
     const viaRelay = new Set();
     for (const link of this.links.values()) {
-      if (link.cid === exceptCid || !link.open) continue;
+      if (link.cid === exceptCid || !link.open || !link.pinned) continue;
       if (link.dc?.readyState === 'open') link.send(msg, { lossy: true });
       else viaRelay.add(link.broker);
     }
     if (!viaRelay.size || now - (this.lastLossy || 0) < LOSSY_RELAY_MS) return;
     this.lastLossy = now;
-    for (const b of viaRelay) b.publish(`${NS}/${this.code}/all`, { k: 'd', m: msg }, true);
+    const env = { k: 'd', m: msg, u: this.hid, n: ++this.bn };
+    for (const b of viaRelay) b.publishSealed(this.room, `${NS}/${this.room.id}/all`, env, true);
   }
 
   close() {
@@ -551,15 +674,20 @@ export class HostHub {
  * 客人：向所有服务器敲门，谁先应答就用谁
  * 失败时 reject {type:'no-room'}（服务器连上了但房主没回应）或 {type:'network'}（一台服务器都连不上）
  */
-export function joinRoom(code, { timeoutMs = 12000, urls = BROKERS } = {}) {
+export async function joinRoom(code, { timeoutMs = 12000, urls = BROKERS } = {}) {
+  const room = await deriveRoom(code);
   const cid = token(12);
+  const cn = token(12);
+  const hostTopic = `${NS}/${room.id}/h`;
+  const myTopic = `${NS}/${room.id}/c/${cid}`;
+  const allTopic = `${NS}/${room.id}/all`;
   const brokers = urls.map((u) => new Broker(u));
   return new Promise((resolve, reject) => {
     let done = false;
     let link = null;
     let knockTimer = null;
     let giveUp = null;
-    const knock = (b) => b.publish(`${NS}/${code}/h`, { k: 'knock', c: cid }, true);
+    const knock = (b) => b.publishSealed(room, hostTopic, { k: 'knock', c: cid, cn }, true);
     const finish = () => {
       done = true;
       clearInterval(knockTimer);
@@ -567,22 +695,36 @@ export function joinRoom(code, { timeoutMs = 12000, urls = BROKERS } = {}) {
       for (const b of brokers) b.onOnline = null;
     };
     for (const b of brokers) {
-      b.subscribe(`${NS}/${code}/c/${cid}`, (env, br) => {
-        if (done) {
-          if (br === link?.broker) link.recv(env);
-          return;
-        }
-        if (env.k !== 'ack') return;
-        finish();
-        for (const other of brokers) if (other !== br) other.stop();
-        link = new Link({ role: 'client', code, cid, broker: br });
-        link.on('close', () => br.stop());
-        // 中转模式下，房主把摇骰画面发到房间广播主题
-        br.subscribe(`${NS}/${code}/all`, (e) => link.kind === 'relay' && link.open && e.k === 'd' && link.emit('data', e.m));
-        br.onOnline = () => link.resume();
-        resolve(link);
-        setTimeout(() => link.upgrade(), 300);
-      });
+      b.subscribe(
+        myTopic,
+        sealedHandler(room, myTopic, (env, br) => {
+          if (done) {
+            if (br === link?.broker) link.accept(env);
+            return;
+          }
+          // 应答必须回应本次的随机数（旧应答重放无效）
+          if (env.k !== 'ack' || env.c !== cid || env.cn !== cn || typeof env.h !== 'string' || !Number.isSafeInteger(env.n)) return;
+          finish();
+          for (const other of brokers) if (other !== br) other.stop();
+          link = new Link({ role: 'client', room, cid, h: env.h, broker: br });
+          link.inN = env.n;
+          link.on('close', () => br.stop());
+          // 中转模式下，房主把摇骰画面发到房间广播主题（同样加密，带递增计数）
+          const hid = String(env.u || '');
+          let bn = 0;
+          br.subscribe(
+            allTopic,
+            sealedHandler(room, allTopic, (e) => {
+              if (e.k !== 'd' || e.u !== hid || !Number.isSafeInteger(e.n) || e.n <= bn) return;
+              bn = e.n;
+              if (link.kind === 'relay' && link.open) link.emit('data', e.m);
+            }),
+          );
+          br.onOnline = () => link.resume();
+          resolve(link);
+          setTimeout(() => link.upgrade(), 300);
+        }),
+      );
       b.onOnline = knock;
       b.start();
     }
