@@ -110,7 +110,8 @@ async function startSession(kind) {
   releaseSeat = null;
   let me = { id: randomId(), key: randomId(), name };
   if (kind === 'client') {
-    const seat = await seatIdentity(code);
+    // 存储被禁用等情况下读不到：用一次性身份照常加入
+    const seat = await seatIdentity(code).catch(() => ({ id: randomId(), key: randomId(), release: () => {} }));
     releaseSeat = seat.release;
     me = { id: seat.id, key: seat.key, name };
   }
