@@ -451,6 +451,7 @@ export class ClientSession extends Emitter {
     link.on('data', (msg) => link === this.link && this.onMsg(msg));
     link.on('close', () => {
       if (link !== this.link) return;
+      // 还在等欢迎（或欢迎刚到、connect 还没往下走）：交给 connect 处理，它会让本次连接失败
       if (this.welcomeWait === wait) return wait.reject({ type: 'network' });
       this.dropped();
     });
@@ -467,6 +468,8 @@ export class ClientSession extends Emitter {
     const retry = setInterval(hello, HELLO_RETRY_MS);
     try {
       await welcome;
+      // 欢迎与断开可能同一时刻到达：欢迎先兑现了，断开时的 reject 就不起作用，这里补上检查
+      if (!link.open) throw { type: 'network' };
     } catch (e) {
       if (this.link === link) this.link = null;
       link.close();

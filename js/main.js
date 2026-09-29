@@ -3,6 +3,7 @@ import { initPhysics, encodeFrames, HAND, PICKUP_MS } from './physics.js';
 import { PRIZES, PRIZE_BY_ID, ZY_LEVELS, totalCakes } from './rules.js';
 import { defaultPool } from './game.js';
 import { HostSession, ClientSession, friendlyError, randomId, normalizeCode, formatCode } from './session.js';
+import { seatIdentity } from './identity.js';
 import { HandController } from './hand.js';
 import { unlockAudio, playImpact, playShake, playChime, playFail, setMuted, isMuted } from './audio.js';
 
@@ -86,37 +87,17 @@ function setupHome() {
   $('in-code').addEventListener('keydown', (e) => e.key === 'Enter' && startSession('client'));
 }
 
-function myIdentity() {
-  // 身份放在 sessionStorage：刷新页面可凭同一 id 重回牌桌，同一浏览器开两个标签页也不会冲突
-  // key：只有本人知道的密钥，房主凭它确认重连的是同一个人（id 在对局状态里人人可见）
-  let id = '';
-  let key = '';
-  try {
-    id = sessionStorage.getItem('bobing.id') || '';
-    key = sessionStorage.getItem('bobing.key') || '';
-    if (!id || !key) {
-      id = randomId();
-      key = randomId();
-      sessionStorage.setItem('bobing.id', id);
-      sessionStorage.setItem('bobing.key', key);
-    }
-  } catch {
-    id ||= randomId();
-    key ||= randomId();
-  }
-  const name = $('in-name').value.trim();
-  return { id, key, name };
-}
+let releaseSeat = null; // 释放本标签页独占的客人身份（见 identity.js）
 
 async function startSession(kind) {
   unlockAudio();
-  const me = myIdentity();
-  if (!me.name) {
+  const name = $('in-name').value.trim();
+  if (!name) {
     setMsg('home-msg', '先给自己起个昵称吧');
     $('in-name').focus();
     return;
   }
-  store.set('bobing.name', me.name);
+  store.set('bobing.name', name);
   const code = normalizeCode($('in-code').value);
   if (kind === 'client' && !code) {
     setMsg('home-msg', '请输入 10 位房间号（如 ABCDE-FGHJK）');
@@ -124,6 +105,15 @@ async function startSession(kind) {
     return;
   }
   setButtonsBusy(true);
+  // 客人：同一浏览器再进同一房间沿用原身份，回到原座位；房主每次开房都是新房间，用新身份即可
+  releaseSeat?.();
+  releaseSeat = null;
+  let me = { id: randomId(), key: randomId(), name };
+  if (kind === 'client') {
+    const seat = await seatIdentity(code);
+    releaseSeat = seat.release;
+    me = { id: seat.id, key: seat.key, name };
+  }
   setMsg('home-msg', kind === 'client' ? '正在寻找房间…' : kind === 'host' ? '正在创建房间…' : '', true);
   const s = kind === 'client' ? new ClientSession({ me, code }) : new HostSession({ mode: kind, me });
   bindSession(s);
@@ -138,6 +128,8 @@ async function startSession(kind) {
   } catch (e) {
     console.warn(e);
     s.close?.();
+    releaseSeat?.();
+    releaseSeat = null;
     setMsg('home-msg', friendlyError(e));
   } finally {
     setButtonsBusy(false);
@@ -199,6 +191,8 @@ document.addEventListener('visibilitychange', () => session && keepAwake(true));
 function leave(msg = '') {
   session?.close();
   session = null;
+  releaseSeat?.();
+  releaseSeat = null;
   keepAwake(false);
   $('net-status').hidden = true;
   clearTimeout(grab?.timer);
