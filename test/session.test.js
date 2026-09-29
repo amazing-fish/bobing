@@ -236,3 +236,63 @@ test('被踢的身份：用同一 id 和密钥重连也回不来（"已被移出
   await assert.rejects(c.open(), { type: 'kicked' });
   host.close();
 });
+
+test('客人：等欢迎时连接断了，本次连接失败并由重连换上新连接，旧连接的失败不影响新连接', async () => {
+  const mk = (behavior) => {
+    const link = new Emitter();
+    link.open = true;
+    link.kind = 'relay';
+    link.broker = { online: true };
+    link.close = () => {
+      if (!link.open) return;
+      link.open = false;
+      link.emit('close');
+    };
+    link.send = (m) => m.type === 'hello' && setTimeout(() => behavior(link));
+    return link;
+  };
+  const welcome = (l) => l.open && l.emit('data', { type: 'welcome', rev: 1, state: { phase: 'lobby', players: [], turn: 0 } });
+  const links = [mk(welcome), mk((l) => l.close()), mk(welcome)];
+  let i = 0;
+  const c = new ClientSession({ me: { id: 'g', name: '客', key: KA }, code: 'ABCDEFGHJK', join: async () => links[i++] });
+  await c.open();
+  assert.equal(c.link, links[0]);
+  // 连接 1 断线 → 重连：连接 2 在欢迎前断了（本次失败），连接 3 成功
+  links[0].close();
+  await until(() => c.link === links[2] && c.status === 'online');
+  assert.equal(i, 3);
+  assert.equal(c.welcomeWait, null);
+  c.close(false);
+});
+
+test('客人：欢迎与断开同时到达（同一次回调里），不会带着已断开的连接进入"在线"，而是去重连', async () => {
+  const mk = (onHello) => {
+    const link = new Emitter();
+    link.open = true;
+    link.kind = 'relay';
+    link.broker = { online: true };
+    link.close = () => {
+      if (!link.open) return;
+      link.open = false;
+      link.emit('close');
+    };
+    link.send = (m) => m.type === 'hello' && setTimeout(() => onHello(link));
+    return link;
+  };
+  const welcome = (l) => l.open && l.emit('data', { type: 'welcome', rev: 1, state: { phase: 'lobby', players: [], turn: 0 } });
+  const links = [
+    mk(welcome),
+    mk((l) => {
+      welcome(l);
+      l.close();
+    }),
+    mk(welcome),
+  ];
+  let i = 0;
+  const c = new ClientSession({ me: { id: 'g', name: '客', key: KA }, code: 'ABCDEFGHJK', join: async () => links[i++] });
+  await c.open();
+  links[0].close();
+  await until(() => c.link === links[2] && c.status === 'online');
+  assert.equal(i, 3, '欢迎后立刻断开的连接不算成功');
+  c.close(false);
+});

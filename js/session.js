@@ -442,12 +442,19 @@ export class ClientSession extends Emitter {
     if (this.closed) return link.close();
     this.link = link;
     this.lastMsg = Date.now();
+    // 每次连接各自等待欢迎：重连循环可能已经换上了新连接，旧连接的失败不能波及它
+    let wait;
     const welcome = new Promise((resolve, reject) => {
-      this.welcomeWait = { resolve, reject };
+      wait = this.welcomeWait = { resolve, reject };
       setTimeout(() => reject({ type: 'timeout' }), 10000);
     });
     link.on('data', (msg) => link === this.link && this.onMsg(msg));
-    link.on('close', () => link === this.link && this.dropped());
+    link.on('close', () => {
+      if (link !== this.link) return;
+      // 还在等欢迎（或欢迎刚到、connect 还没往下走）：交给 connect 处理，它会让本次连接失败
+      if (this.welcomeWait === wait) return wait.reject({ type: 'network' });
+      this.dropped();
+    });
     link.on('kind', () => link === this.link && this.emit('net', this.status));
     link.on('resume', () => {
       if (link !== this.link) return;
@@ -461,13 +468,15 @@ export class ClientSession extends Emitter {
     const retry = setInterval(hello, HELLO_RETRY_MS);
     try {
       await welcome;
+      // 欢迎与断开可能同一时刻到达：欢迎先兑现了，断开时的 reject 就不起作用，这里补上检查
+      if (!link.open) throw { type: 'network' };
     } catch (e) {
-      this.link = null;
+      if (this.link === link) this.link = null;
       link.close();
       throw e;
     } finally {
       clearInterval(retry);
-      this.welcomeWait = null;
+      if (this.welcomeWait === wait) this.welcomeWait = null;
     }
     this.setStatus('online');
   }

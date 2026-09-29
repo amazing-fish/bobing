@@ -17,6 +17,15 @@ function sampleFrames(frames, f, out) {
   return out;
 }
 
+const PRE_EASE = 0.12; // 预演悬停前的减速时长（秒）
+
+/** 播放速率从 r0 在 R 秒内线性升到 1：经过 el 秒后走过的轨迹时长 */
+function rampTime(el, r0, R) {
+  if (!(R > 0) || r0 >= 1) return el;
+  if (el < R) return r0 * el + ((1 - r0) * el * el) / (2 * R);
+  return el - ((1 - r0) * R) / 2;
+}
+
 const _qa = new THREE.Quaternion();
 const _qb = new THREE.Quaternion();
 function mixFrames(a, b, k, out) {
@@ -128,6 +137,7 @@ export class Stage {
 
     this.anim = null; // 回放中的投掷
     this.live = null; // 本机实时摇骰的当前帧
+    this.pre = null; // 投掷者松手后的本机预演（等房主结果）
     this.hold = []; // 观战：他人摇骰的采样缓冲
     this.fallback = null; // 观战数据中断时退回的姿态
     this.blend = null; // 姿态切换时的短暂过渡
@@ -273,6 +283,7 @@ export class Stage {
   setRest(values) {
     this.anim = null;
     this.live = null;
+    this.pre = null;
     this.hold = [];
     this.fallback = null;
     this.blend = null;
@@ -399,12 +410,46 @@ export class Stage {
   /** 本机实时摇骰/预测的帧；传 null 结束 */
   setLive(frame, handVisible) {
     if (frame && !this.live) this.startBlend(220);
+    this.pre = null;
     this.live = frame;
     this.liveHand = handVisible;
     if (frame) {
       this.hold = [];
       this.fallback = null;
     }
+  }
+
+  /**
+   * 投掷者松手：播放本机预演的开头（骰子飞向碗），在 holdAt 前缓缓减速、悬停，等房主的权威轨迹接上
+   * @param pre {frames, fps, holdAt}
+   */
+  playPrelude(pre) {
+    this.live = null;
+    this.hold = [];
+    this.fallback = null;
+    this.pre = { ...pre, start: performance.now() };
+  }
+
+  /** 预演进行到第几秒、此刻的播放速率（0..1） */
+  preludeClock(now = performance.now()) {
+    const p = this.pre;
+    if (!p) return null;
+    const el = (now - p.start) / 1000;
+    // 前段按真实速度；最后 ease 秒起指数减速，无限逼近 holdAt（速度连续）
+    const ease = Math.min(PRE_EASE, p.holdAt);
+    const t1 = p.holdAt - ease;
+    if (el <= t1) return { t: el, rate: 1 };
+    const k = Math.exp(-(el - t1) / ease);
+    return { t: t1 + ease * (1 - k), rate: k };
+  }
+
+  /** 预演等不到结果（房主无响应）：骰子落回碗底 */
+  settle() {
+    if (!this.pre && !this.live) return;
+    this.fallback = this.restFrom(this.cur);
+    this.pre = null;
+    this.live = null;
+    this.startBlend(400);
   }
 
   /** 观战：收到他人摇骰的采样 */
@@ -432,12 +477,14 @@ export class Stage {
   /**
    * 回放一次投掷轨迹
    * @param roll {frames, fps, holdFrames, sounds}
-   * @param {{startAt?: number, lead?: number, blend?: number, arc?: boolean}} o
-   *   startAt：从轨迹的第几秒开始（投掷者本机已预测过的部分）；lead：开始前的过渡时长（毫秒，时钟暂停）
+   * @param {{startAt?: number, rate0?: number, ramp?: number, lead?: number, blend?: number, arc?: boolean}} o
+   *   startAt：从轨迹的第几秒开始（投掷者本机已预演过的部分）；rate0/ramp：起始播放速率，在 ramp 毫秒内线性加速到 1
+   *   （接上悬停中的预演）；lead：开始前的过渡时长（毫秒，时钟暂停）
    */
   playRoll(roll, onSound, o = {}) {
     if (this.anim) this.anim.resolve();
     this.live = null;
+    this.pre = null;
     this.hold = [];
     this.fallback = null;
     const startAt = o.startAt ?? 0;
@@ -446,7 +493,9 @@ export class Stage {
       const sounds = roll.sounds;
       let soundIdx = 0;
       while (soundIdx < sounds.length && sounds[soundIdx].t < startAt) soundIdx++;
-      this.anim = { roll, start: performance.now(), startAt, lead: o.lead ?? 0, arc: !!o.arc, soundIdx, onSound, resolve };
+      const rate0 = Math.min(1, Math.max(0, o.rate0 ?? 1));
+      const ramp = (o.ramp ?? 0) / 1000;
+      this.anim = { roll, start: performance.now(), startAt, rate0, ramp, lead: o.lead ?? 0, arc: !!o.arc, soundIdx, onSound, resolve };
     });
   }
 
@@ -457,7 +506,7 @@ export class Stage {
       const el = now - a.start;
       const { frames, fps } = a.roll;
       const n = frames.length / STRIDE;
-      const t = a.startAt + Math.max(0, el - a.lead) / 1000;
+      const t = a.startAt + rampTime(Math.max(0, el - a.lead) / 1000, a.rate0, a.ramp);
       const sounds = a.roll.sounds;
       while (a.soundIdx < sounds.length && sounds[a.soundIdx].t <= t) a.onSound?.(sounds[a.soundIdx++]);
       const f = t * fps;
@@ -467,6 +516,10 @@ export class Stage {
         a.resolve();
       }
       return [this.tmp, f < (a.roll.holdFrames || 0)];
+    }
+    if (this.pre) {
+      const { t } = this.preludeClock(now);
+      return [sampleFrames(this.pre.frames, t * this.pre.fps, this.tmp), false];
     }
     if (this.live) return [this.live, this.liveHand];
     if (this.hold.length) {
