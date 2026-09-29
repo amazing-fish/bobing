@@ -75,6 +75,29 @@ test('不同房间各用各的身份；过期的记录会被清掉；存储不�
   assert.notEqual(c.id, a.id, '3 天前的身份不再沿用');
   c.release();
   const broken = { getItem() { throw new Error('denied'); }, setItem() { throw new Error('denied'); } };
-  const d = await seatIdentity(CODE, { local: broken, session: broken, locks: undefined });
+  const d = await seatIdentity(CODE, { local: broken, session: broken, locks: fakeLocks() });
   assert.ok(d.id && d.key.length >= 16);
+  d.release();
+});
+
+test('浏览器不支持 Web Locks：两个标签页不共用身份（否则后开的会把先开的顶下线），刷新仍能回来', async () => {
+  const local = mem();
+  const tab1 = mem();
+  // null = 没有 navigator.locks（undefined 会触发参数默认值，用上真实的 navigator.locks）
+  const broken = [
+    null,
+    { request: () => Promise.reject(new Error('SecurityError')) },
+    {
+      request() {
+        throw new Error('SecurityError');
+      },
+    },
+  ];
+  for (const locks of broken) {
+    const a = await seatIdentity(CODE, { local, session: tab1, locks });
+    const b = await seatIdentity(CODE, { local, session: mem(), locks });
+    assert.notEqual(a.id, b.id);
+    const again = await seatIdentity(CODE, { local, session: tab1, locks });
+    assert.equal(again.id, a.id, '同一标签页刷新沿用');
+  }
 });

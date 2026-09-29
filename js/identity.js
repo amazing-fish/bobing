@@ -1,7 +1,8 @@
 // 客人在某个房间里的身份 { id, key }：按房间号记在 localStorage，关掉标签页、浏览器杀掉后台页面、
 // 从聊天软件重新打开链接，都能凭同一身份回到原座位（之前放在 sessionStorage，换个标签页就成了同名的新玩家）。
 // 同一浏览器同时开两个标签页进同一房间：用 Web Locks 独占身份，第二个标签页拿不到锁就用新身份，
-// 两边不会互相顶掉。
+// 两边不会互相顶掉。浏览器不支持 Web Locks 时没法判断别的标签页是否正在用，退回每个标签页各自一个身份
+// （与以前一样：刷新能回来，关页重开是新玩家），宁可多一个同名玩家，也不让两个标签页互相踢下线。
 import { randomId } from './session.js';
 
 const ROOMS_KEY = 'bobing.rooms';
@@ -25,20 +26,26 @@ function write(storage, k, v) {
 
 const valid = (x) => x && typeof x.id === 'string' && typeof x.key === 'string' && x.id && x.key.length >= 16;
 
-/** 试着独占这个身份；拿到锁返回释放函数，被别的标签页占着返回 null。浏览器不支持时视为拿到 */
+const NO_LOCKS = Symbol('no-locks');
+
+/** 试着独占这个身份：拿到锁返回释放函数，被别的标签页占着返回 null，浏览器用不了 Web Locks 返回 NO_LOCKS */
 async function tryHold(locks, code, id) {
-  if (!locks?.request) return () => {};
+  if (!locks?.request) return NO_LOCKS;
   let release;
   const held = new Promise((r) => (release = r));
   const got = await new Promise((resolve) => {
-    locks
-      .request(`bobing/${code}/${id}`, { ifAvailable: true }, (lock) => {
-        resolve(!!lock);
-        return lock ? held : undefined;
-      })
-      .catch(() => resolve(true));
+    try {
+      locks
+        .request(`bobing/${code}/${id}`, { ifAvailable: true }, (lock) => {
+          resolve(!!lock);
+          return lock ? held : undefined;
+        })
+        .catch(() => resolve(NO_LOCKS));
+    } catch {
+      resolve(NO_LOCKS);
+    }
   });
-  return got ? release : null;
+  return got === NO_LOCKS ? NO_LOCKS : got ? release : null;
 }
 
 /**
@@ -46,8 +53,20 @@ async function tryHold(locks, code, id) {
  * @returns {Promise<{id: string, key: string, release: () => void}>}
  */
 export async function seatIdentity(code, { local = globalThis.localStorage, session = globalThis.sessionStorage, locks = globalThis.navigator?.locks, now = Date.now() } = {}) {
-  const rooms = read(local, ROOMS_KEY);
   const tab = read(session, TAB_KEY);
+  const fresh = () => ({ id: randomId(), key: randomId() });
+  // 用不了锁：只认本标签页自己的身份
+  const perTab = () => {
+    const me = valid(tab[code]) ? { id: tab[code].id, key: tab[code].key } : fresh();
+    tab[code] = me;
+    write(session, TAB_KEY, tab);
+    return { ...me, release: () => {} };
+  };
+  // 先确认锁能用（有的浏览器有 API 但在当前页面里会报错）
+  const probe = await tryHold(locks, code, `probe-${randomId()}`);
+  if (probe === NO_LOCKS) return perTab();
+  probe?.();
+  const rooms = read(local, ROOMS_KEY);
   // 先用本标签页上次用过的（刷新），再用这个浏览器上次在该房间的
   if (valid(rooms[code]) && now - (rooms[code].t || 0) >= TTL_MS) delete rooms[code];
   const candidates = [tab[code], rooms[code]].filter(valid);
@@ -55,14 +74,16 @@ export async function seatIdentity(code, { local = globalThis.localStorage, sess
   let release = null;
   for (const c of candidates) {
     release = await tryHold(locks, code, c.id);
+    if (release === NO_LOCKS) return perTab();
     if (release) {
       me = { id: c.id, key: c.key };
       break;
     }
   }
   if (!me) {
-    me = { id: randomId(), key: randomId() };
-    release = (await tryHold(locks, code, me.id)) || (() => {});
+    me = fresh();
+    const r = await tryHold(locks, code, me.id);
+    release = typeof r === 'function' ? r : () => {};
   }
   tab[code] = me;
   write(session, TAB_KEY, tab);
